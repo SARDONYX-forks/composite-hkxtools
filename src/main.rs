@@ -6,7 +6,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const HKXC_EXE: &[u8] = include_bytes!("hkxc.exe");
+const HKXCMD_EXE: &[u8] = include_bytes!("hkxcmd.exe");
 
 struct HkxToolsApp {
     input_paths: Vec<PathBuf>,
@@ -168,7 +168,7 @@ impl HkxToolsApp {
 
             println!("Converting {:?} to {:?}", input_path, output_path);
 
-            self.run_hkxc(input_path, &output_path)?;
+            self.run_hkxcmd(input_path, &output_path)?;
 
             if !output_path.exists() {
                 return Err(anyhow::anyhow!(
@@ -184,31 +184,31 @@ impl HkxToolsApp {
         Ok(())
     }
 
-    fn run_hkxc(&self, input: &Path, output: &Path) -> Result<()> {
-        let mut command = Command::new("hkxc");
+    fn run_hkxcmd(&self, input: &Path, output: &Path) -> Result<()> {
+        let mut command = Command::new("hkxcmd");
         command.arg("convert");
-        command.arg("--input").arg(input);
-        command.arg("--output").arg(output);
+        command.arg("-i").arg(input);
+        command.arg("-o").arg(output);
 
-        command.arg("--format").arg(match self.output_format {
-            OutputFormat::Xml => "xml",
-            OutputFormat::SkyrimLE => "win32",
-            OutputFormat::SkyrimSE => "amd64",
-        });
+        command.arg(format!("-v:{}", match self.output_format {
+            OutputFormat::Xml => "XML",
+            OutputFormat::SkyrimLE => "WIN32",
+            OutputFormat::SkyrimSE => "AMD64",
+        }));
 
-        let output = command.output().context("Failed to execute hkxc")?;
+        let output = command.output().context("Failed to execute hkxcmd")?;
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
 
-        eprintln!("hkxc stdout:\n{}", stdout);
-        eprintln!("hkxc stderr:\n{}", stderr);
+        eprintln!("hkxcmd stdout:\n{}", stdout);
+        eprintln!("hkxcmd stderr:\n{}", stderr);
 
-        println!("hkxc stdout:\n{}", stdout);
-        println!("hkxc stderr:\n{}", stderr);
+        println!("hkxcmd stdout:\n{}", stdout);
+        println!("hkxcmd stderr:\n{}", stderr);
 
         if !output.status.success() {
-            return Err(anyhow::anyhow!("hkxc failed: {}", stderr));
+            return Err(anyhow::anyhow!("hkxcmd failed: {}", stderr));
         }
 
         Ok(())
@@ -351,15 +351,15 @@ impl eframe::App for HkxToolsApp {
 }
 
 fn main() -> Result<(), eframe::Error> {
-    // Write hkxc.exe to a temporary location
+    // Write hkxcmd.exe to a temporary location
     let temp_dir = tempfile::Builder::new()
         .prefix("hkxtools_")
         .tempdir()
         .unwrap();
-    let hkxc_path = temp_dir.path().join("hkxc.exe");
-    fs::write(&hkxc_path, HKXC_EXE).unwrap();
+    let hkxcmd_path = temp_dir.path().join("hkxcmd.exe");
+    fs::write(&hkxcmd_path, HKXCMD_EXE).unwrap();
 
-    // Add hkxc.exe to the PATH
+    // Add hkxcmd.exe to the PATH
     let mut path = std::env::var("PATH").unwrap_or_default();
     path.push_str(&format!(";{}", temp_dir.path().to_str().unwrap()));
     std::env::set_var("PATH", path);
