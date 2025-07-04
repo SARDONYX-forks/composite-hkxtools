@@ -57,4 +57,4 @@ SOFTWARE.
 
 ## Credits
 
-- hkxc.exe: This project uses the CLI hkxc.exe from [serde-hkx](https://www.nexusmods.com/skyrimspecialedition/mods/126214/) by SARDONYX.
+- hkxc.exe: This project uses a custom compiled CLI hkxc.exe based on [serde-hkx](https://www.nexusmods.com/skyrimspecialedition/mods/126214/) by SARDONYX.
