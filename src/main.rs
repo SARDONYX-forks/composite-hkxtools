@@ -8,11 +8,30 @@ use std::process::Command;
 
 const HKXCMD_EXE: &[u8] = include_bytes!("hkxcmd.exe");
 
+#[derive(PartialEq, Clone, Copy, Debug)]
+enum InputFileExtension {
+    All,
+    Hkx,
+    Xml,
+}
+
+impl InputFileExtension {
+    fn label(&self) -> &'static str {
+        match self {
+            InputFileExtension::All => "All (HKX & XML)",
+            InputFileExtension::Hkx => "HKX only",
+            InputFileExtension::Xml => "XML only",
+        }
+    }
+}
+
 struct HkxToolsApp {
     input_paths: Vec<PathBuf>,
     output_folder: Option<PathBuf>,
     output_suffix: String,
     output_format: OutputFormat,
+    custom_extension: Option<String>,
+    input_file_extension: InputFileExtension,
 }
 
 #[derive(PartialEq, Clone, Copy, Debug)]
@@ -46,6 +65,8 @@ impl Default for HkxToolsApp {
             output_folder: None,
             output_suffix: String::new(),
             output_format: OutputFormat::Xml,
+            custom_extension: None,
+            input_file_extension: InputFileExtension::All,
         }
     }
 }
@@ -65,8 +86,20 @@ impl HkxToolsApp {
         for entry in entries {
             let entry = entry?;
             let path = entry.path();
-            if path.is_file() && path.extension().map_or(false, |ext| ext == "hkx") {
-                if !self.input_paths.contains(&path) {
+            if path.is_file() {
+                let matches = match self.input_file_extension {
+                    InputFileExtension::All => {
+                        path.extension().map_or(false, |ext| ext == "hkx" || ext == "xml")
+                    }
+                    InputFileExtension::Hkx => {
+                        path.extension().map_or(false, |ext| ext == "hkx")
+                    }
+                    InputFileExtension::Xml => {
+                        path.extension().map_or(false, |ext| ext == "xml")
+                    }
+                };
+                
+                if matches && !self.input_paths.contains(&path) {
                     self.input_paths.push(path);
                 }
             }
@@ -78,8 +111,20 @@ impl HkxToolsApp {
         for entry in walkdir::WalkDir::new(folder).follow_links(true) {
             let entry = entry?;
             let path = entry.path().to_path_buf();
-            if path.is_file() && path.extension().map_or(false, |ext| ext == "hkx") {
-                if !self.input_paths.contains(&path) {
+            if path.is_file() {
+                let matches = match self.input_file_extension {
+                    InputFileExtension::All => {
+                        path.extension().map_or(false, |ext| ext == "hkx" || ext == "xml")
+                    }
+                    InputFileExtension::Hkx => {
+                        path.extension().map_or(false, |ext| ext == "hkx")
+                    }
+                    InputFileExtension::Xml => {
+                        path.extension().map_or(false, |ext| ext == "xml")
+                    }
+                };
+                
+                if matches && !self.input_paths.contains(&path) {
                     self.input_paths.push(path);
                 }
             }
@@ -96,7 +141,9 @@ impl HkxToolsApp {
     fn get_output_path(&self, input_path: &Path) -> Option<PathBuf> {
         let output_base = self.output_folder.as_ref()?;
         let file_name = input_path.file_stem()?.to_str()?;
-        let extension = self.output_format.extension();
+        let extension = self.custom_extension.as_ref()
+            .map(|s| s.as_str())
+            .unwrap_or_else(|| self.output_format.extension());
 
         let base_dir = if self.input_paths.len() == 1 {
             input_path.parent().unwrap_or(Path::new(""))
@@ -231,6 +278,23 @@ impl HkxToolsApp {
             .num_columns(2)
             .spacing([10.0, 10.0])
             .show(ui, |ui| {
+                ui.label("Input File Filter:");
+                ui.horizontal(|ui| {
+                    for filter in [
+                        InputFileExtension::All,
+                        InputFileExtension::Hkx,
+                        InputFileExtension::Xml,
+                    ] {
+                        if ui
+                            .selectable_label(self.input_file_extension == filter, filter.label())
+                            .clicked()
+                        {
+                            self.input_file_extension = filter;
+                        }
+                    }
+                });
+                ui.end_row();
+
                 ui.label("Input Files:");
                 ui.vertical(|ui| {
                     ui.horizontal(|ui| {
@@ -260,6 +324,32 @@ impl HkxToolsApp {
                 });
                 ui.end_row();
 
+                ui.label("Output Folder:");
+                self.render_output_folder(ui);
+                ui.end_row();
+
+                ui.label("Output Suffix:");
+                ui.text_edit_singleline(&mut self.output_suffix);
+                ui.end_row();
+
+                ui.label("Custom Extension:");
+                ui.horizontal(|ui| {
+                    let mut extension_text = self.custom_extension.as_ref().cloned().unwrap_or_default();
+                    if ui.text_edit_singleline(&mut extension_text).changed() {
+                        self.custom_extension = if extension_text.is_empty() {
+                            None
+                        } else {
+                            Some(extension_text)
+                        };
+                    }
+                    ui.label("(optional - leave empty to use format default)");
+                });
+                ui.end_row();
+
+                ui.label("Output Format:");
+                self.render_output_format(ui);
+                ui.end_row();
+
                 ui.label("Selected Files:");
                 ui.vertical(|ui| {
                     let mut files_to_remove = Vec::new();
@@ -275,18 +365,6 @@ impl HkxToolsApp {
                         self.input_paths.remove(*index);
                     }
                 });
-                ui.end_row();
-
-                ui.label("Output Folder:");
-                self.render_output_folder(ui);
-                ui.end_row();
-
-                ui.label("Output Suffix:");
-                ui.text_edit_singleline(&mut self.output_suffix);
-                ui.end_row();
-
-                ui.label("Output Format:");
-                self.render_output_format(ui);
                 ui.end_row();
             });
 

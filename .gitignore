@@ -11,3 +11,4 @@ target/.rustc_info.json
 Cargo.lock
 target/CACHEDIR.TAG
 target/release/.cargo-lock
+testing/
