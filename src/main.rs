@@ -7,6 +7,22 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const HKXCMD_EXE: &[u8] = include_bytes!("hkxcmd.exe");
+const HKXC_EXE: &[u8] = include_bytes!("hkxc.exe");
+
+#[derive(PartialEq, Clone, Copy, Debug)]
+enum ConverterTool {
+    HkxCmd,
+    HkxC,
+}
+
+impl ConverterTool {
+    fn label(&self) -> &'static str {
+        match self {
+            ConverterTool::HkxCmd => "hkxcmd",
+            ConverterTool::HkxC => "hkxc",
+        }
+    }
+}
 
 #[derive(PartialEq, Clone, Copy, Debug)]
 enum InputFileExtension {
@@ -32,6 +48,9 @@ struct HkxToolsApp {
     output_format: OutputFormat,
     custom_extension: Option<String>,
     input_file_extension: InputFileExtension,
+    converter_tool: ConverterTool,
+    hkxcmd_path: PathBuf,
+    hkxc_path: PathBuf,
 }
 
 #[derive(PartialEq, Clone, Copy, Debug)]
@@ -67,11 +86,28 @@ impl Default for HkxToolsApp {
             output_format: OutputFormat::Xml,
             custom_extension: None,
             input_file_extension: InputFileExtension::All,
+            converter_tool: ConverterTool::HkxCmd,
+            hkxcmd_path: PathBuf::new(),
+            hkxc_path: PathBuf::new(),
         }
     }
 }
 
 impl HkxToolsApp {
+    fn new(hkxcmd_path: PathBuf, hkxc_path: PathBuf) -> Self {
+        Self {
+            input_paths: Vec::new(),
+            output_folder: None,
+            output_suffix: String::new(),
+            output_format: OutputFormat::Xml,
+            custom_extension: None,
+            input_file_extension: InputFileExtension::All,
+            converter_tool: ConverterTool::HkxCmd,
+            hkxcmd_path,
+            hkxc_path,
+        }
+    }
+
     fn add_files_from_folder(&mut self, folder: &Path, recursive: bool) -> Result<()> {
         if recursive {
             self.add_files_recursive(folder)
@@ -215,7 +251,7 @@ impl HkxToolsApp {
 
             println!("Converting {:?} to {:?}", input_path, output_path);
 
-            self.run_hkxcmd(input_path, &output_path)?;
+            self.run_conversion_tool(input_path, &output_path)?;
 
             if !output_path.exists() {
                 return Err(anyhow::anyhow!(
@@ -231,31 +267,63 @@ impl HkxToolsApp {
         Ok(())
     }
 
-    fn run_hkxcmd(&self, input: &Path, output: &Path) -> Result<()> {
-        let mut command = Command::new("hkxcmd");
+    fn run_conversion_tool(&self, input: &Path, output: &Path) -> Result<()> {
+        let (executable_path, tool_name) = match self.converter_tool {
+            ConverterTool::HkxCmd => (&self.hkxcmd_path, "hkxcmd"),
+            ConverterTool::HkxC => (&self.hkxc_path, "hkxc"),
+        };
+
+        let mut command = Command::new(executable_path);
         command.arg("convert");
-        command.arg("-i").arg(input);
-        command.arg("-o").arg(output);
 
-        command.arg(format!("-v:{}", match self.output_format {
-            OutputFormat::Xml => "XML",
-            OutputFormat::SkyrimLE => "WIN32",
-            OutputFormat::SkyrimSE => "AMD64",
-        }));
+        match self.converter_tool {
+            ConverterTool::HkxCmd => {
+                command.arg("-i").arg(input);
+                command.arg("-o").arg(output);
+                command.arg(format!("-v:{}", match self.output_format {
+                    OutputFormat::Xml => "XML",
+                    OutputFormat::SkyrimLE => "WIN32",
+                    OutputFormat::SkyrimSE => "AMD64",
+                }));
+            }
+            ConverterTool::HkxC => {
+                command.arg("--input").arg(input);
+                command.arg("--output").arg(output);
+                command.arg("--format").arg(match self.output_format {
+                    OutputFormat::Xml => "xml",
+                    OutputFormat::SkyrimLE => "win32",
+                    OutputFormat::SkyrimSE => "amd64",
+                });
+            }
+        }
 
-        let output = command.output().context("Failed to execute hkxcmd")?;
+        // Print the exact command being executed
+        let mut cmd_string = String::new();
+        cmd_string.push_str(&executable_path.to_string_lossy());
+        for arg in command.get_args() {
+            cmd_string.push(' ');
+            cmd_string.push_str(&arg.to_string_lossy());
+        }
+        println!("🔧 EXECUTING COMMAND: {}", cmd_string);
+        println!("📁 Working directory: {:?}", std::env::current_dir().unwrap_or_default());
+        println!("📥 Input file: {:?}", input);
+        println!("📤 Output file: {:?}", output);
+        println!("🛠️  Tool: {} | Format: {:?}", tool_name, self.output_format);
+        println!("🎯 Using embedded executable: {:?}", executable_path);
+
+        let output = command.output().context("Failed to execute converter tool")?;
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
 
-        eprintln!("hkxcmd stdout:\n{}", stdout);
-        eprintln!("hkxcmd stderr:\n{}", stderr);
+        eprintln!("{} stdout:\n{}", tool_name, stdout);
+        eprintln!("{} stderr:\n{}", tool_name, stderr);
 
-        println!("hkxcmd stdout:\n{}", stdout);
-        println!("hkxcmd stderr:\n{}", stderr);
+        println!("{} stdout:\n{}", tool_name, stdout);
+        println!("{} stderr:\n{}", tool_name, stderr);
 
         if !output.status.success() {
-            return Err(anyhow::anyhow!("hkxcmd failed: {}", stderr));
+            return Err(anyhow::anyhow!("{} failed: {}", tool_name, stderr));
         }
 
         Ok(())
@@ -290,6 +358,19 @@ impl HkxToolsApp {
                             .clicked()
                         {
                             self.input_file_extension = filter;
+                        }
+                    }
+                });
+                ui.end_row();
+
+                ui.label("Converter Tool:");
+                ui.horizontal(|ui| {
+                    for tool in [ConverterTool::HkxCmd, ConverterTool::HkxC] {
+                        if ui
+                            .selectable_label(self.converter_tool == tool, tool.label())
+                            .clicked()
+                        {
+                            self.converter_tool = tool;
                         }
                     }
                 });
@@ -349,24 +430,47 @@ impl HkxToolsApp {
                 ui.label("Output Format:");
                 self.render_output_format(ui);
                 ui.end_row();
-
-                ui.label("Selected Files:");
-                ui.vertical(|ui| {
-                    let mut files_to_remove = Vec::new();
-                    for (index, path) in self.input_paths.iter().enumerate() {
-                        ui.horizontal(|ui| {
-                            ui.label(path.file_name().unwrap_or_default().to_string_lossy());
-                            if ui.small_button("❌").clicked() {
-                                files_to_remove.push(index);
-                            }
-                        });
-                    }
-                    for index in files_to_remove.iter().rev() {
-                        self.input_paths.remove(*index);
-                    }
-                });
-                ui.end_row();
             });
+
+        ui.add_space(10.0);
+
+        // Selected Files section outside the grid for more space
+        ui.horizontal(|ui| {
+            ui.label("Selected Files:");
+            ui.label(format!("{} files selected", self.input_paths.len()));
+            if ui.button("Clear All").clicked() {
+                self.input_paths.clear();
+            }
+        });
+        
+        // Scrollable area for file list with maximum height
+        let scroll_area_height = 200.0;
+        let files_to_remove = ui.allocate_ui_with_layout(
+            egui::Vec2::new(ui.available_width(), scroll_area_height),
+            egui::Layout::top_down(egui::Align::LEFT),
+            |ui| {
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false; 2])
+                    .show(ui, |ui| {
+                        let mut files_to_remove = Vec::new();
+                        for (index, path) in self.input_paths.iter().enumerate() {
+                            ui.horizontal(|ui| {
+                                if ui.small_button("❌").clicked() {
+                                    files_to_remove.push(index);
+                                }
+                                ui.label(path.file_name().unwrap_or_default().to_string_lossy());
+                            });
+                        }
+                        files_to_remove
+                    })
+                    .inner
+            },
+        ).inner;
+        
+        // Remove files after the ScrollArea
+        for index in files_to_remove.iter().rev() {
+            self.input_paths.remove(*index);
+        }
 
         ui.add_space(10.0);
 
@@ -429,23 +533,29 @@ impl eframe::App for HkxToolsApp {
 }
 
 fn main() -> Result<(), eframe::Error> {
-    // Write hkxcmd.exe to a temporary location
+    // Write both hkxcmd.exe and hkxc.exe to a temporary location
     let temp_dir = tempfile::Builder::new()
         .prefix("hkxtools_")
         .tempdir()
         .unwrap();
+    
     let hkxcmd_path = temp_dir.path().join("hkxcmd.exe");
+    let hkxc_path = temp_dir.path().join("hkxc.exe");
+    
     fs::write(&hkxcmd_path, HKXCMD_EXE).unwrap();
+    fs::write(&hkxc_path, HKXC_EXE).unwrap();
 
-    // Add hkxcmd.exe to the PATH
-    let mut path = std::env::var("PATH").unwrap_or_default();
-    path.push_str(&format!(";{}", temp_dir.path().to_str().unwrap()));
-    std::env::set_var("PATH", path);
+    println!("🔧 Extracted hkxcmd.exe to: {:?}", hkxcmd_path);
+    println!("🔧 Extracted hkxc.exe to: {:?}", hkxc_path);
 
     let options = eframe::NativeOptions::default();
+    
+    // Keep temp_dir alive for the entire application lifetime
+    let _temp_dir_guard = temp_dir;
+    
     eframe::run_native(
         "HKX Tools GUI",
         options,
-        Box::new(|_cc| Ok(Box::new(HkxToolsApp::default()))),
+        Box::new(move |_cc| Ok(Box::new(HkxToolsApp::new(hkxcmd_path, hkxc_path)))),
     )
 }
