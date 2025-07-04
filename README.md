@@ -1,4 +1,4 @@
-# HKX Conversion Tool
+# Composite HKX Conversion Tool
 
 HKX Conversion Tool is a GUI wrapper for hkxc.exe for converting Havok files between different formats for Skyrim modding. 
 
