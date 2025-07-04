@@ -304,12 +304,12 @@ impl HkxToolsApp {
             cmd_string.push(' ');
             cmd_string.push_str(&arg.to_string_lossy());
         }
-        println!("🔧 EXECUTING COMMAND: {}", cmd_string);
-        println!("📁 Working directory: {:?}", std::env::current_dir().unwrap_or_default());
-        println!("📥 Input file: {:?}", input);
-        println!("📤 Output file: {:?}", output);
-        println!("🛠️  Tool: {} | Format: {:?}", tool_name, self.output_format);
-        println!("🎯 Using embedded executable: {:?}", executable_path);
+        println!("EXECUTING COMMAND: {}", cmd_string);
+        println!("Working directory: {:?}", std::env::current_dir().unwrap_or_default());
+        println!("Input file: {:?}", input);
+        println!("Output file: {:?}", output);
+        println!("Tool: {} | Format: {:?}", tool_name, self.output_format);
+        println!("Using embedded executable: {:?}", executable_path);
 
         let output = command.output().context("Failed to execute converter tool")?;
 
@@ -545,8 +545,8 @@ fn main() -> Result<(), eframe::Error> {
     fs::write(&hkxcmd_path, HKXCMD_EXE).unwrap();
     fs::write(&hkxc_path, HKXC_EXE).unwrap();
 
-    println!("🔧 Extracted hkxcmd.exe to: {:?}", hkxcmd_path);
-    println!("🔧 Extracted hkxc.exe to: {:?}", hkxc_path);
+    println!("Extracted hkxcmd.exe to: {:?}", hkxcmd_path);
+    println!("Extracted hkxc.exe to: {:?}", hkxc_path);
 
     let options = eframe::NativeOptions::default();
     
