@@ -771,13 +771,16 @@ fn main() -> Result<(), eframe::Error> {
     println!("Extracted hkxc.exe to: {:?}", hkxc_path);
     println!("Extracted hkxconv.exe to: {:?}", hkxconv_path);
 
-    let options = eframe::NativeOptions::default();
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default().with_inner_size([600.0, 605.0]),
+        ..Default::default()
+    };
     
     // Keep temp_dir alive for the entire application lifetime
     let _temp_dir_guard = temp_dir;
     
     eframe::run_native(
-        "HKX Tools GUI",
+        "Composite HKX Conversion GUI",
         options,
         Box::new(move |_cc| Ok(Box::new(HkxToolsApp::new(hkxcmd_path, hkxc_path, hkxconv_path)))),
     )
