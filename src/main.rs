@@ -4,7 +4,9 @@ use egui::{Color32, Context as EguiContext, RichText, Ui};
 use rfd::FileDialog;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use tokio::process::Command;
+use tokio::sync::{mpsc, oneshot};
+use futures::future::join_all;
 
 const HKXCMD_EXE: &[u8] = include_bytes!("hkxcmd.exe");
 const HKXC_EXE: &[u8] = include_bytes!("hkxc.exe");
@@ -32,6 +34,22 @@ enum ConversionMode {
     Regular,    // HKX <-> XML
     KfToHkx,    // KF -> HKX (requires skeleton)
     HkxToKf,    // HKX -> KF (requires skeleton)
+}
+
+#[derive(Debug, Clone)]
+enum ConversionStatus {
+    Idle,
+    Running { current_file: String, progress: usize, total: usize },
+    Completed { message: String },
+    Error { message: String },
+}
+
+#[derive(Debug)]
+struct ConversionProgress {
+    current_file: String,
+    file_index: usize,
+    total_files: usize,
+    status: ConversionStatus,
 }
 
 impl ConversionMode {
@@ -84,6 +102,11 @@ struct HkxToolsApp {
     hkxcmd_path: PathBuf,
     hkxc_path: PathBuf,
     hkxconv_path: PathBuf,
+    // Async operation fields
+    conversion_status: ConversionStatus,
+    progress_rx: Option<mpsc::UnboundedReceiver<ConversionProgress>>,
+    cancel_tx: Option<oneshot::Sender<()>>,
+    tokio_handle: tokio::runtime::Handle,
 }
 
 #[derive(PartialEq, Clone, Copy, Debug)]
@@ -125,12 +148,127 @@ impl Default for HkxToolsApp {
             hkxcmd_path: PathBuf::new(),
             hkxc_path: PathBuf::new(),
             hkxconv_path: PathBuf::new(),
+            conversion_status: ConversionStatus::Idle,
+            progress_rx: None,
+            cancel_tx: None,
+            tokio_handle: tokio::runtime::Handle::current(),
         }
     }
 }
 
+// Temporary context for async conversion operations
+struct TempConversionContext {
+    converter_tool: ConverterTool,
+    conversion_mode: ConversionMode,
+    output_format: OutputFormat,
+    skeleton_file: Option<PathBuf>,
+    hkxcmd_path: PathBuf,
+    hkxc_path: PathBuf,
+    hkxconv_path: PathBuf,
+}
+
+impl TempConversionContext {
+    async fn run_conversion_tool(&self, input: &Path, output: &Path) -> Result<()> {
+        let (executable_path, tool_name) = match self.converter_tool {
+            ConverterTool::HkxCmd => (&self.hkxcmd_path, "hkxcmd"),
+            ConverterTool::HkxC => (&self.hkxc_path, "hkxc"),
+            ConverterTool::HkxConv => (&self.hkxconv_path, "hkxconv"),
+        };
+
+        let mut command = Command::new(executable_path);
+        
+        // Set the command based on conversion mode
+        match self.conversion_mode {
+            ConversionMode::Regular => {
+                command.arg("convert");
+            }
+            ConversionMode::KfToHkx => {
+                command.arg("convertkf");
+            }
+            ConversionMode::HkxToKf => {
+                command.arg("exportkf");
+            }
+        }
+
+        // Add arguments based on conversion mode and tool
+        match (self.conversion_mode, self.converter_tool) {
+            (ConversionMode::Regular, ConverterTool::HkxCmd) => {
+                command.arg("-i").arg(input);
+                command.arg("-o").arg(output);
+                command.arg(format!("-v:{}", match self.output_format {
+                    OutputFormat::Xml => "XML",
+                    OutputFormat::SkyrimLE => "WIN32",
+                    OutputFormat::SkyrimSE => "AMD64",
+                }));
+            }
+            (ConversionMode::Regular, ConverterTool::HkxC) => {
+                command.arg("--input").arg(input);
+                command.arg("--output").arg(output);
+                command.arg("--format").arg(match self.output_format {
+                    OutputFormat::Xml => "xml",
+                    OutputFormat::SkyrimLE => "win32",
+                    OutputFormat::SkyrimSE => "amd64",
+                });
+            }
+            (ConversionMode::KfToHkx, ConverterTool::HkxCmd) => {
+                if let Some(skeleton) = &self.skeleton_file {
+                    command.arg(skeleton);
+                }
+                command.arg(input);
+                command.arg(output);
+                command.arg(format!("-v:{}", match self.output_format {
+                    OutputFormat::Xml => "XML",
+                    OutputFormat::SkyrimLE => "WIN32",
+                    OutputFormat::SkyrimSE => "AMD64",
+                }));
+            }
+            (ConversionMode::HkxToKf, ConverterTool::HkxCmd) => {
+                if let Some(skeleton) = &self.skeleton_file {
+                    command.arg(skeleton);
+                }
+                command.arg(input);
+                command.arg(output);
+            }
+            (ConversionMode::KfToHkx, ConverterTool::HkxC) => {
+                return Err(anyhow::anyhow!("hkxc does not support KF conversion"));
+            }
+            (ConversionMode::HkxToKf, ConverterTool::HkxC) => {
+                return Err(anyhow::anyhow!("hkxc does not support KF conversion"));
+            }
+            (ConversionMode::Regular, ConverterTool::HkxConv) => {
+                command.arg("convert");
+                command.arg(input);
+                command.arg(output);
+                command.arg("-v").arg(match self.output_format {
+                    OutputFormat::Xml => "xml",
+                    OutputFormat::SkyrimLE => "hkx",
+                    OutputFormat::SkyrimSE => "hkx",
+                });
+            }
+            (ConversionMode::KfToHkx, ConverterTool::HkxConv) => {
+                return Err(anyhow::anyhow!("hkxconv does not support KF conversion"));
+            }
+            (ConversionMode::HkxToKf, ConverterTool::HkxConv) => {
+                return Err(anyhow::anyhow!("hkxconv does not support KF conversion"));
+            }
+        }
+
+        // Print the command being executed (without individual args for simplicity)
+        println!("EXECUTING COMMAND: {:?}", executable_path);
+
+        let output = command.output().await.context("Failed to execute converter tool")?;
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        if !output.status.success() {
+            return Err(anyhow::anyhow!("{} failed: {}", tool_name, stderr));
+        }
+
+        Ok(())
+    }
+}
+
 impl HkxToolsApp {
-    fn new(hkxcmd_path: PathBuf, hkxc_path: PathBuf, hkxconv_path: PathBuf) -> Self {
+    fn new(hkxcmd_path: PathBuf, hkxc_path: PathBuf, hkxconv_path: PathBuf, tokio_handle: tokio::runtime::Handle) -> Self {
         Self {
             input_paths: Vec::new(),
             output_folder: None,
@@ -144,6 +282,10 @@ impl HkxToolsApp {
             hkxcmd_path,
             hkxc_path,
             hkxconv_path,
+            conversion_status: ConversionStatus::Idle,
+            progress_rx: None,
+            cancel_tx: None,
+            tokio_handle,
         }
     }
 
@@ -295,168 +437,276 @@ impl HkxToolsApp {
         Some(common)
     }
 
-    fn run_conversion(&mut self) -> Result<()> {
+    fn start_conversion(&mut self) {
+        // Validation
         if self.input_paths.is_empty() {
-            return Err(anyhow::anyhow!("No input files selected"));
+            self.conversion_status = ConversionStatus::Error {
+                message: "No input files selected".to_string(),
+            };
+            return;
         }
         if self.output_folder.is_none() {
-            return Err(anyhow::anyhow!("No output folder selected"));
+            self.conversion_status = ConversionStatus::Error {
+                message: "No output folder selected".to_string(),
+            };
+            return;
         }
         if self.conversion_mode.requires_skeleton() && self.skeleton_file.is_none() {
-            return Err(anyhow::anyhow!("Skeleton file is required for animation conversion"));
+            self.conversion_status = ConversionStatus::Error {
+                message: "Skeleton file is required for animation conversion".to_string(),
+            };
+            return;
         }
 
-        for input_path in &self.input_paths {
-            let output_path = self
-                .get_output_path(input_path)
-                .context("Failed to determine output path")?;
+        // Setup channels for progress communication
+        let (progress_tx, progress_rx) = mpsc::unbounded_channel();
+        let (cancel_tx, cancel_rx) = oneshot::channel();
+        
+        self.progress_rx = Some(progress_rx);
+        self.cancel_tx = Some(cancel_tx);
+        self.conversion_status = ConversionStatus::Running {
+            current_file: "Starting...".to_string(),
+            progress: 0,
+            total: self.input_paths.len(),
+        };
+
+        // Clone data needed for the async task
+        let input_paths = self.input_paths.clone();
+        let output_folder = self.output_folder.clone().unwrap();
+        let skeleton_file = self.skeleton_file.clone();
+        let output_suffix = self.output_suffix.clone();
+        let output_format = self.output_format;
+        let custom_extension = self.custom_extension.clone();
+        let conversion_mode = self.conversion_mode;
+        let converter_tool = self.converter_tool;
+        let hkxcmd_path = self.hkxcmd_path.clone();
+        let hkxc_path = self.hkxc_path.clone();
+        let hkxconv_path = self.hkxconv_path.clone();
+
+        // Spawn the async conversion task
+        self.tokio_handle.spawn(async move {
+            let result = Self::run_conversion_async(
+                input_paths,
+                output_folder,
+                skeleton_file,
+                output_suffix,
+                output_format,
+                custom_extension,
+                conversion_mode,
+                converter_tool,
+                hkxcmd_path,
+                hkxc_path,
+                hkxconv_path,
+                progress_tx,
+                cancel_rx,
+            ).await;
+
+            // The task will complete on its own
+            drop(result);
+        });
+    }
+
+    async fn run_conversion_async(
+        input_paths: Vec<PathBuf>,
+        output_folder: PathBuf,
+        skeleton_file: Option<PathBuf>,
+        output_suffix: String,
+        output_format: OutputFormat,
+        custom_extension: Option<String>,
+        conversion_mode: ConversionMode,
+        converter_tool: ConverterTool,
+        hkxcmd_path: PathBuf,
+        hkxc_path: PathBuf,
+        hkxconv_path: PathBuf,
+        progress_tx: mpsc::UnboundedSender<ConversionProgress>,
+        mut cancel_rx: oneshot::Receiver<()>,
+    ) -> Result<()> {
+        let total_files = input_paths.len();
+
+        // Create all conversion tasks concurrently
+        let mut conversion_tasks = Vec::new();
+        
+        for (index, input_path) in input_paths.iter().enumerate() {
+            // Check for cancellation before starting
+            if cancel_rx.try_recv().is_ok() {
+                let _ = progress_tx.send(ConversionProgress {
+                    current_file: "Cancelled".to_string(),
+                    file_index: index,
+                    total_files,
+                    status: ConversionStatus::Error {
+                        message: "Conversion cancelled by user".to_string(),
+                    },
+                });
+                return Ok(());
+            }
+
+            let output_path = Self::get_output_path_static(
+                input_path,
+                &output_folder,
+                &output_suffix,
+                output_format,
+                &custom_extension,
+                conversion_mode,
+            ).context("Failed to determine output path")?;
 
             if let Some(parent) = output_path.parent() {
                 fs::create_dir_all(parent).context("Failed to create output directories")?;
             }
 
-            println!("Converting {:?} to {:?}", input_path, output_path);
+            println!("Preparing to convert {:?} to {:?}", input_path, output_path);
 
-            self.run_conversion_tool(input_path, &output_path)?;
+            // Create a temporary app-like structure for the conversion tool call
+            let temp_app = TempConversionContext {
+                converter_tool,
+                conversion_mode,
+                output_format,
+                skeleton_file: skeleton_file.clone(),
+                hkxcmd_path: hkxcmd_path.clone(),
+                hkxc_path: hkxc_path.clone(),
+                hkxconv_path: hkxconv_path.clone(),
+            };
 
-            if !output_path.exists() {
-                return Err(anyhow::anyhow!(
-                    "Output file was not created: {:?}",
-                    output_path
-                ));
-            }
-            println!("Output file created successfully: {:?}", output_path);
-            let metadata = fs::metadata(&output_path)?;
-            println!("Output file size: {} bytes", metadata.len());
+            // Clone needed data for the async task
+            let input_path_clone = input_path.clone();
+            let output_path_clone = output_path.clone();
+            let progress_tx_clone = progress_tx.clone();
+            let file_name = input_path.file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+
+            // Create individual conversion task
+            let conversion_task = tokio::spawn(async move {
+                // Send progress update when starting this file
+                let _ = progress_tx_clone.send(ConversionProgress {
+                    current_file: file_name.clone(),
+                    file_index: index,
+                    total_files,
+                    status: ConversionStatus::Running {
+                        current_file: file_name.clone(),
+                        progress: index,
+                        total: total_files,
+                    },
+                });
+
+                println!("Starting conversion of {:?}", input_path_clone);
+
+                // Run the actual conversion
+                let result = temp_app.run_conversion_tool(&input_path_clone, &output_path_clone).await;
+
+                match result {
+                    Ok(_) => {
+                        if !output_path_clone.exists() {
+                            let error_msg = format!("Output file was not created: {:?}", output_path_clone);
+                            let _ = progress_tx_clone.send(ConversionProgress {
+                                current_file: file_name.clone(),
+                                file_index: index,
+                                total_files,
+                                status: ConversionStatus::Error {
+                                    message: error_msg.clone(),
+                                },
+                            });
+                            return Err(anyhow::anyhow!(error_msg));
+                        }
+
+                        println!("Completed conversion of {:?}", input_path_clone);
+                        let metadata = fs::metadata(&output_path_clone)?;
+                        println!("Output file size: {} bytes", metadata.len());
+                        Ok(())
+                    }
+                    Err(e) => {
+                        let _ = progress_tx_clone.send(ConversionProgress {
+                            current_file: file_name.clone(),
+                            file_index: index,
+                            total_files,
+                            status: ConversionStatus::Error {
+                                message: format!("Failed to convert {}: {}", file_name, e),
+                            },
+                        });
+                        Err(e)
+                    }
+                }
+            });
+
+            conversion_tasks.push(conversion_task);
         }
+
+        // Wait for all conversions to complete concurrently
+        let results = join_all(conversion_tasks).await;
+        
+        // Check results and count successes
+        let mut successful_conversions = 0;
+        for result in results {
+            // Check for cancellation
+            if cancel_rx.try_recv().is_ok() {
+                let _ = progress_tx.send(ConversionProgress {
+                    current_file: "Cancelled".to_string(),
+                    file_index: successful_conversions,
+                    total_files,
+                    status: ConversionStatus::Error {
+                        message: "Conversion cancelled by user".to_string(),
+                    },
+                });
+                return Ok(());
+            }
+
+            match result {
+                Ok(Ok(())) => {
+                    successful_conversions += 1;
+                }
+                Ok(Err(e)) => {
+                    return Err(e);
+                }
+                Err(e) => {
+                    return Err(anyhow::anyhow!("Task failed: {}", e));
+                }
+            }
+        }
+
+        // Send completion message
+        let _ = progress_tx.send(ConversionProgress {
+            current_file: "Completed".to_string(),
+            file_index: successful_conversions,
+            total_files,
+            status: ConversionStatus::Completed {
+                message: format!("Successfully converted {} of {} files", successful_conversions, total_files),
+            },
+        });
 
         Ok(())
     }
 
-    fn run_conversion_tool(&self, input: &Path, output: &Path) -> Result<()> {
-        let (executable_path, tool_name) = match self.converter_tool {
-            ConverterTool::HkxCmd => (&self.hkxcmd_path, "hkxcmd"),
-            ConverterTool::HkxC => (&self.hkxc_path, "hkxc"),
-            ConverterTool::HkxConv => (&self.hkxconv_path, "hkxconv"),
+    // Static helper method for output path calculation
+    fn get_output_path_static(
+        input_path: &Path,
+        output_folder: &Path,
+        output_suffix: &str,
+        output_format: OutputFormat,
+        custom_extension: &Option<String>,
+        conversion_mode: ConversionMode,
+    ) -> Option<PathBuf> {
+        let file_name = input_path.file_stem()?.to_str()?;
+        
+        let extension = if let Some(custom_ext) = custom_extension {
+            custom_ext.as_str()
+        } else {
+            match conversion_mode {
+                ConversionMode::Regular => output_format.extension(),
+                ConversionMode::KfToHkx => "hkx",
+                ConversionMode::HkxToKf => "kf",
+            }
         };
 
-        let mut command = Command::new(executable_path);
-        
-        // Set the command based on conversion mode
-        match self.conversion_mode {
-            ConversionMode::Regular => {
-                command.arg("convert");
-            }
-            ConversionMode::KfToHkx => {
-                command.arg("convertkf");
-            }
-            ConversionMode::HkxToKf => {
-                command.arg("exportkf");
-            }
-        }
+        let output_name = if output_suffix.is_empty() {
+            format!("{}.{}", file_name, extension)
+        } else {
+            format!("{}_{}.{}", file_name, output_suffix, extension)
+        };
 
-        // Add arguments based on conversion mode and tool
-        match (self.conversion_mode, self.converter_tool) {
-            (ConversionMode::Regular, ConverterTool::HkxCmd) => {
-                command.arg("-i").arg(input);
-                command.arg("-o").arg(output);
-                command.arg(format!("-v:{}", match self.output_format {
-                    OutputFormat::Xml => "XML",
-                    OutputFormat::SkyrimLE => "WIN32",
-                    OutputFormat::SkyrimSE => "AMD64",
-                }));
-            }
-            (ConversionMode::Regular, ConverterTool::HkxC) => {
-                command.arg("--input").arg(input);
-                command.arg("--output").arg(output);
-                command.arg("--format").arg(match self.output_format {
-                    OutputFormat::Xml => "xml",
-                    OutputFormat::SkyrimLE => "win32",
-                    OutputFormat::SkyrimSE => "amd64",
-                });
-            }
-            (ConversionMode::KfToHkx, ConverterTool::HkxCmd) => {
-                // hkxcmd ConvertKF [skel.hkx] [anim.kf] [anim.hkx]
-                if let Some(skeleton) = &self.skeleton_file {
-                    command.arg(skeleton);
-                }
-                command.arg(input);
-                command.arg(output);
-                command.arg(format!("-v:{}", match self.output_format {
-                    OutputFormat::Xml => "XML",
-                    OutputFormat::SkyrimLE => "WIN32",
-                    OutputFormat::SkyrimSE => "AMD64",
-                }));
-            }
-            (ConversionMode::HkxToKf, ConverterTool::HkxCmd) => {
-                // hkxcmd ExportKF [skel.hkx] [anim.hkx] [anim.kf]
-                if let Some(skeleton) = &self.skeleton_file {
-                    command.arg(skeleton);
-                }
-                command.arg(input);
-                command.arg(output);
-                // ExportKF uses different version flags, using defaults for now
-            }
-            (ConversionMode::KfToHkx, ConverterTool::HkxC) => {
-                // hkxc doesn't support KF conversion, this should be disabled in UI
-                return Err(anyhow::anyhow!("hkxc does not support KF conversion"));
-            }
-            (ConversionMode::HkxToKf, ConverterTool::HkxC) => {
-                // hkxc doesn't support KF conversion, this should be disabled in UI
-                return Err(anyhow::anyhow!("hkxc does not support KF conversion"));
-            }
-            (ConversionMode::Regular, ConverterTool::HkxConv) => {
-                // hkxconv convert <input> <output> -v <hkx|xml>
-                command.arg("convert");
-                command.arg(input);
-                command.arg(output);
-                command.arg("-v").arg(match self.output_format {
-                    OutputFormat::Xml => "xml",
-                    OutputFormat::SkyrimLE => "hkx", // hkxconv only supports SSE/64-bit, but we'll use hkx
-                    OutputFormat::SkyrimSE => "hkx", // hkxconv only supports SSE/64-bit
-                });
-            }
-            (ConversionMode::KfToHkx, ConverterTool::HkxConv) => {
-                // hkxconv doesn't support KF conversion
-                return Err(anyhow::anyhow!("hkxconv does not support KF conversion"));
-            }
-            (ConversionMode::HkxToKf, ConverterTool::HkxConv) => {
-                // hkxconv doesn't support KF conversion
-                return Err(anyhow::anyhow!("hkxconv does not support KF conversion"));
-            }
-        }
-
-        // Print the exact command being executed
-        let mut cmd_string = String::new();
-        cmd_string.push_str(&executable_path.to_string_lossy());
-        for arg in command.get_args() {
-            cmd_string.push(' ');
-            cmd_string.push_str(&arg.to_string_lossy());
-        }
-        println!("EXECUTING COMMAND: {}", cmd_string);
-        println!("Working directory: {:?}", std::env::current_dir().unwrap_or_default());
-        println!("Input file: {:?}", input);
-        println!("Output file: {:?}", output);
-        println!("Tool: {} | Mode: {:?} | Format: {:?}", tool_name, self.conversion_mode, self.output_format);
-        println!("Using embedded executable: {:?}", executable_path);
-
-        let output = command.output().context("Failed to execute converter tool")?;
-
-        // let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-
-        // eprintln!("{} stdout:\n{}", tool_name, stdout);
-        // eprintln!("{} stderr:\n{}", tool_name, stderr);
-
-        // println!("{} stdout:\n{}", tool_name, stdout);
-        // println!("{} stderr:\n{}", tool_name, stderr);
-
-        if !output.status.success() {
-            return Err(anyhow::anyhow!("{} failed: {}", tool_name, stderr));
-        }
-
-        Ok(())
+        Some(output_folder.join(output_name))
     }
+
+
 
     fn render_main_ui(&mut self, ui: &mut egui::Ui) {
         ui.vertical_centered(|ui| {
@@ -676,11 +926,7 @@ impl HkxToolsApp {
 
         ui.add_space(10.0);
 
-        ui.horizontal(|ui| {
-            if ui.button("Run Conversion").clicked() {
-                self.handle_conversion(ui);
-            }
-        });
+        self.handle_conversion(ui);
     }
 
     fn render_output_folder(&mut self, ui: &mut Ui) {
@@ -733,12 +979,66 @@ impl HkxToolsApp {
 
     fn handle_conversion(&mut self, ui: &mut Ui) {
         ui.add_space(5.0);
-        match self.run_conversion() {
-            Ok(_) => {
-                ui.colored_label(Color32::GREEN, "✓ Conversion completed successfully");
+        
+        // Check for progress updates
+        if let Some(progress_rx) = &mut self.progress_rx {
+            while let Ok(progress) = progress_rx.try_recv() {
+                self.conversion_status = progress.status;
+                // Request repaint to update UI immediately
+                ui.ctx().request_repaint();
             }
-            Err(e) => {
-                ui.colored_label(Color32::RED, format!("❌ Error during conversion: {}", e));
+        }
+
+        // Clone the current status to avoid borrow checker issues
+        let current_status = self.conversion_status.clone();
+        
+        // Display status and controls based on current state
+        match current_status {
+            ConversionStatus::Idle => {
+                if ui.button("Run Conversion").clicked() {
+                    self.start_conversion();
+                }
+            }
+            ConversionStatus::Running { current_file, progress, total } => {
+                let mut should_cancel = false;
+                ui.horizontal(|ui| {
+                    ui.label(format!("Converting: {}", current_file));
+                    if ui.button("Cancel").clicked() {
+                        should_cancel = true;
+                    }
+                });
+                
+                if should_cancel {
+                    if let Some(cancel_tx) = self.cancel_tx.take() {
+                        let _ = cancel_tx.send(());
+                    }
+                    self.conversion_status = ConversionStatus::Idle;
+                }
+                
+                // Progress bar
+                let progress_fraction = if total > 0 { progress as f32 / total as f32 } else { 0.0 };
+                let progress_bar = egui::ProgressBar::new(progress_fraction)
+                    .text(format!("{}/{}", progress, total));
+                ui.add(progress_bar);
+                
+                // Request continuous repaints while running
+                ui.ctx().request_repaint();
+            }
+            ConversionStatus::Completed { message } => {
+                ui.colored_label(Color32::GREEN, format!("OK: {}", message));
+                if ui.button("Run Another Conversion").clicked() {
+                    self.conversion_status = ConversionStatus::Idle;
+                    self.progress_rx = None;
+                    self.cancel_tx = None;
+                }
+            }
+            ConversionStatus::Error { message } => {
+                ui.colored_label(Color32::RED, format!("NOT OK: {}", message));
+                if ui.button("Try Again").clicked() {
+                    self.conversion_status = ConversionStatus::Idle;
+                    self.progress_rx = None;
+                    self.cancel_tx = None;
+                }
             }
         }
     }
@@ -752,7 +1052,11 @@ impl eframe::App for HkxToolsApp {
     }
 }
 
-fn main() -> Result<(), eframe::Error> {
+#[tokio::main]
+async fn main() -> Result<(), eframe::Error> {
+    // Create a tokio runtime handle for the GUI
+    let tokio_handle = tokio::runtime::Handle::current();
+
     // Write hkxcmd.exe, hkxc.exe, and hkxconv.exe to a temporary location
     let temp_dir = tempfile::Builder::new()
         .prefix("hkxtools_")
@@ -772,7 +1076,7 @@ fn main() -> Result<(), eframe::Error> {
     println!("Extracted hkxconv.exe to: {:?}", hkxconv_path);
 
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([600.0, 605.0]),
+        viewport: egui::ViewportBuilder::default().with_inner_size([600.0, 625.0]),
         ..Default::default()
     };
     
@@ -782,6 +1086,6 @@ fn main() -> Result<(), eframe::Error> {
     eframe::run_native(
         "Composite HKX Conversion GUI",
         options,
-        Box::new(move |_cc| Ok(Box::new(HkxToolsApp::new(hkxcmd_path, hkxc_path, hkxconv_path)))),
+        Box::new(move |_cc| Ok(Box::new(HkxToolsApp::new(hkxcmd_path, hkxc_path, hkxconv_path, tokio_handle)))),
     )
 }

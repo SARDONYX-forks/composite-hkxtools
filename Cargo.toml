@@ -18,6 +18,8 @@ encoding_rs = "0.8.34"
 egui_extras = "0.28.1"
 winres = "0.1"
 walkdir = "2.3"
+tokio = { version = "1.0", features = ["process", "rt", "rt-multi-thread", "macros", "sync"] }
+futures = "0.3"
 
 [build-dependencies]
 winres = "0.1"
