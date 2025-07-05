@@ -13,3 +13,6 @@ target/CACHEDIR.TAG
 target/release/.cargo-lock
 testing/
 target/
+test_input/
+test_output/
+test_output_1/

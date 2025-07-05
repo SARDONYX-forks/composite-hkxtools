@@ -316,11 +316,11 @@ impl HkxToolsApp {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
 
-        eprintln!("{} stdout:\n{}", tool_name, stdout);
-        eprintln!("{} stderr:\n{}", tool_name, stderr);
+        // eprintln!("{} stdout:\n{}", tool_name, stdout);
+        // eprintln!("{} stderr:\n{}", tool_name, stderr);
 
-        println!("{} stdout:\n{}", tool_name, stdout);
-        println!("{} stderr:\n{}", tool_name, stderr);
+        // println!("{} stdout:\n{}", tool_name, stdout);
+        // println!("{} stderr:\n{}", tool_name, stderr);
 
         if !output.status.success() {
             return Err(anyhow::anyhow!("{} failed: {}", tool_name, stderr));
