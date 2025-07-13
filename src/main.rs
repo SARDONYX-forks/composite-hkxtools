@@ -175,6 +175,15 @@ impl TempConversionContext {
             ConverterTool::HkxConv => (&self.hkxconv_path, "hkxconv"),
         };
 
+        // Convert paths to absolute paths to avoid issues with paths starting with '-'
+        let input_absolute = input.canonicalize().unwrap_or_else(|_| input.to_path_buf());
+        let output_absolute = output.canonicalize().unwrap_or_else(|_| output.to_path_buf());
+        
+        // Also handle skeleton file if it exists
+        let skeleton_absolute = self.skeleton_file.as_ref().map(|skeleton| {
+            skeleton.canonicalize().unwrap_or_else(|_| skeleton.to_path_buf())
+        });
+
         let mut command = Command::new(executable_path);
         
         // Set the command based on conversion mode
@@ -193,8 +202,8 @@ impl TempConversionContext {
         // Add arguments based on conversion mode and tool
         match (self.conversion_mode, self.converter_tool) {
             (ConversionMode::Regular, ConverterTool::HkxCmd) => {
-                command.arg("-i").arg(input);
-                command.arg("-o").arg(output);
+                command.arg("-i").arg(&input_absolute);
+                command.arg("-o").arg(&output_absolute);
                 command.arg(format!("-v:{}", match self.output_format {
                     OutputFormat::Xml => "XML",
                     OutputFormat::SkyrimLE => "WIN32",
@@ -202,8 +211,8 @@ impl TempConversionContext {
                 }));
             }
             (ConversionMode::Regular, ConverterTool::HkxC) => {
-                command.arg("--input").arg(input);
-                command.arg("--output").arg(output);
+                command.arg("--input").arg(&input_absolute);
+                command.arg("--output").arg(&output_absolute);
                 command.arg("--format").arg(match self.output_format {
                     OutputFormat::Xml => "xml",
                     OutputFormat::SkyrimLE => "win32",
@@ -211,11 +220,11 @@ impl TempConversionContext {
                 });
             }
             (ConversionMode::KfToHkx, ConverterTool::HkxCmd) => {
-                if let Some(skeleton) = &self.skeleton_file {
+                if let Some(skeleton) = &skeleton_absolute {
                     command.arg(skeleton);
                 }
-                command.arg(input);
-                command.arg(output);
+                command.arg(&input_absolute);
+                command.arg(&output_absolute);
                 command.arg(format!("-v:{}", match self.output_format {
                     OutputFormat::Xml => "XML",
                     OutputFormat::SkyrimLE => "WIN32",
@@ -223,11 +232,11 @@ impl TempConversionContext {
                 }));
             }
             (ConversionMode::HkxToKf, ConverterTool::HkxCmd) => {
-                if let Some(skeleton) = &self.skeleton_file {
+                if let Some(skeleton) = &skeleton_absolute {
                     command.arg(skeleton);
                 }
-                command.arg(input);
-                command.arg(output);
+                command.arg(&input_absolute);
+                command.arg(&output_absolute);
             }
             (ConversionMode::KfToHkx, ConverterTool::HkxC) => {
                 return Err(anyhow::anyhow!("hkxc does not support KF conversion"));
@@ -237,8 +246,8 @@ impl TempConversionContext {
             }
             (ConversionMode::Regular, ConverterTool::HkxConv) => {
                 command.arg("convert");
-                command.arg(input);
-                command.arg(output);
+                command.arg(&input_absolute);
+                command.arg(&output_absolute);
                 command.arg("-v").arg(match self.output_format {
                     OutputFormat::Xml => "xml",
                     OutputFormat::SkyrimLE => "hkx",
@@ -253,8 +262,8 @@ impl TempConversionContext {
             }
         }
 
-        // Print the command being executed (without individual args for simplicity)
-        println!("EXECUTING COMMAND: {:?}", executable_path);
+        // Print the command being executed for debugging
+        println!("EXECUTING COMMAND: {:?} with input: {:?}, output: {:?}", executable_path, input_absolute, output_absolute);
 
         let output = command.output().await.context("Failed to execute converter tool")?;
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -368,6 +377,82 @@ impl HkxToolsApp {
     fn update_output_folder(&mut self) {
         if let Some(input_path) = self.input_paths.first() {
             self.output_folder = Some(input_path.parent().unwrap_or(Path::new("")).to_path_buf());
+        }
+    }
+
+    /// Add a single file to the input files list, checking if it matches the current extension filter
+    fn add_file(&mut self, file_path: PathBuf) -> bool {
+        if !file_path.is_file() {
+            return false;
+        }
+
+        let matches = match self.input_file_extension {
+            InputFileExtension::All => {
+                if self.converter_tool == ConverterTool::HkxCmd {
+                    file_path.extension().map_or(false, |ext| ext == "hkx" || ext == "xml" || ext == "kf")
+                } else {
+                    // hkxc and hkxconv don't support KF files
+                    file_path.extension().map_or(false, |ext| ext == "hkx" || ext == "xml")
+                }
+            }
+            InputFileExtension::Hkx => {
+                file_path.extension().map_or(false, |ext| ext == "hkx")
+            }
+            InputFileExtension::Xml => {
+                file_path.extension().map_or(false, |ext| ext == "xml")
+            }
+            InputFileExtension::Kf => {
+                file_path.extension().map_or(false, |ext| ext == "kf")
+            }
+        };
+
+        if matches && !self.input_paths.contains(&file_path) {
+            self.input_paths.push(file_path);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Process dropped files and add valid ones to the input files list
+    fn handle_dropped_files(&mut self, dropped_files: Vec<egui::DroppedFile>) {
+        let mut files_added = 0;
+        let mut files_skipped = 0;
+
+        for dropped_file in dropped_files {
+            if let Some(path) = dropped_file.path {
+                if path.is_file() {
+                    if self.add_file(path) {
+                        files_added += 1;
+                    } else {
+                        files_skipped += 1;
+                    }
+                } else if path.is_dir() {
+                    // If a directory is dropped, add all files from it (non-recursive)
+                    if let Ok(entries) = std::fs::read_dir(&path) {
+                        for entry in entries.flatten() {
+                            let entry_path = entry.path();
+                            if entry_path.is_file() {
+                                if self.add_file(entry_path) {
+                                    files_added += 1;
+                                } else {
+                                    files_skipped += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Update output folder if files were added
+        if files_added > 0 {
+            self.update_output_folder();
+        }
+
+        // Print feedback for debugging
+        if files_added > 0 || files_skipped > 0 {
+            println!("Drag & Drop: Added {} files, skipped {} files", files_added, files_skipped);
         }
     }
 
@@ -895,6 +980,11 @@ impl HkxToolsApp {
             }
         });
         
+        // Show drag and drop hint
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("💡 Tip: You can drag and drop files or folders directly onto this window").color(Color32::from_rgb(100, 100, 100)).size(12.0));
+        });
+        
         // Scrollable area for file list with maximum height
         let scroll_area_height = 200.0;
         let files_to_remove = ui.allocate_ui_with_layout(
@@ -1046,7 +1136,20 @@ impl HkxToolsApp {
 
 impl eframe::App for HkxToolsApp {
     fn update(&mut self, ctx: &EguiContext, _frame: &mut Frame) {
+        // Handle drag and drop files
+        if !ctx.input(|i| i.raw.dropped_files.is_empty()) {
+            let dropped_files = ctx.input(|i| i.raw.dropped_files.clone());
+            self.handle_dropped_files(dropped_files);
+        }
+
         egui::CentralPanel::default().show(ctx, |ui| {
+            // Show visual feedback when files are being dragged over the window
+            if ctx.input(|i| i.raw.hovered_files.len() > 0) {
+                let hovered_files = ctx.input(|i| i.raw.hovered_files.clone());
+                ui.colored_label(Color32::from_rgb(0, 150, 255), format!("📁 Ready to drop {} file(s)", hovered_files.len()));
+                ui.separator();
+            }
+            
             self.render_main_ui(ui);
         });
     }
