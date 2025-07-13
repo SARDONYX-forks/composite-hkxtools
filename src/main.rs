@@ -456,6 +456,119 @@ impl HkxToolsApp {
         }
     }
 
+    /// Render a visual overlay when files are being dragged over the window
+    fn render_drag_drop_overlay(&self, ctx: &EguiContext, hovered_files_count: usize) {
+        // Create a semi-transparent overlay covering the entire window
+        egui::Area::new("drag_drop_overlay".into())
+            .fixed_pos(egui::Pos2::ZERO)
+            .show(ctx, |ui| {
+                // Get the available screen space
+                let screen_rect = ctx.screen_rect();
+                
+                // Draw semi-transparent background
+                ui.allocate_ui_at_rect(screen_rect, |ui| {
+                    // Background with semi-transparent blue
+                    ui.painter().rect_filled(
+                        screen_rect,
+                        egui::Rounding::ZERO,
+                        Color32::from_rgba_unmultiplied(0, 100, 200, 100), // Semi-transparent blue
+                    );
+                    
+                    // Add animated dashed border for better visual feedback
+                    let border_color = Color32::from_rgb(0, 150, 255);
+                    let border_width = 4.0;
+                    
+                    // Create a dashed border effect by drawing multiple smaller rectangles
+                    let margin = border_width / 2.0;
+                    let inner_rect = screen_rect.shrink(margin);
+                    
+                    // Draw the main border
+                    ui.painter().rect_stroke(
+                        inner_rect,
+                        egui::Rounding::same(5.0),
+                        egui::Stroke::new(border_width, border_color),
+                    );
+                    
+                    // Add an inner glow effect with a slightly smaller rectangle
+                    let glow_rect = inner_rect.shrink(border_width);
+                    ui.painter().rect_stroke(
+                        glow_rect,
+                        egui::Rounding::same(5.0),
+                        egui::Stroke::new(1.0, Color32::from_rgba_unmultiplied(0, 150, 255, 150)),
+                    );
+                    
+                    // Center the content
+                    ui.allocate_ui_at_rect(screen_rect, |ui| {
+                        ui.centered_and_justified(|ui| {
+                            ui.vertical_centered(|ui| {
+                                // Create a centered box for the content
+                                ui.allocate_ui_with_layout(
+                                    egui::Vec2::new(400.0, 300.0),
+                                    egui::Layout::top_down(egui::Align::Center),
+                                    |ui| {
+                                        ui.add_space(20.0);
+                                        
+                                        // Large drop icon with background
+                                        ui.label(RichText::new("⬇").size(80.0).color(Color32::WHITE));
+                                        
+                                        ui.add_space(15.0);
+                                        
+                                        // Main drop message
+                                        ui.label(
+                                            RichText::new("Drop Files Here")
+                                                .size(28.0)
+                                                .color(Color32::WHITE)
+                                                .strong()
+                                        );
+                                        
+                                        ui.add_space(15.0);
+                                        
+                                        // File count and supported formats
+                                        let file_text = if hovered_files_count == 1 {
+                                            "1 file ready to drop".to_string()
+                                        } else {
+                                            format!("{} files ready to drop", hovered_files_count)
+                                        };
+                                        
+                                        ui.label(
+                                            RichText::new(file_text)
+                                                .size(18.0)
+                                                .color(Color32::from_rgb(200, 230, 255))
+                                        );
+                                        
+                                        ui.add_space(10.0);
+                                        
+                                        // Supported formats
+                                        let supported_formats = match self.converter_tool {
+                                            ConverterTool::HkxCmd => "Supports: HKX, XML, KF files",
+                                            ConverterTool::HkxC | ConverterTool::HkxConv => "Supports: HKX, XML files",
+                                        };
+                                        
+                                        ui.label(
+                                            RichText::new(supported_formats)
+                                                .size(14.0)
+                                                .color(Color32::from_rgb(180, 210, 255))
+                                                .italics()
+                                        );
+                                        
+                                        ui.add_space(10.0);
+                                        
+                                        // Add a subtle hint about folder support
+                                        ui.label(
+                                            RichText::new("Files and folders are supported")
+                                                .size(12.0)
+                                                .color(Color32::from_rgb(150, 180, 220))
+                                                .italics()
+                                        );
+                                    }
+                                );
+                            });
+                        });
+                    });
+                });
+            });
+    }
+
     fn get_output_path(&self, input_path: &Path) -> Option<PathBuf> {
         let output_base = self.output_folder.as_ref()?;
         let file_name = input_path.file_stem()?.to_str()?;
@@ -1136,6 +1249,10 @@ impl HkxToolsApp {
 
 impl eframe::App for HkxToolsApp {
     fn update(&mut self, ctx: &EguiContext, _frame: &mut Frame) {
+        // Check if files are being hovered over the window
+        let files_being_hovered = ctx.input(|i| i.raw.hovered_files.len() > 0);
+        let hovered_files_count = ctx.input(|i| i.raw.hovered_files.len());
+
         // Handle drag and drop files
         if !ctx.input(|i| i.raw.dropped_files.is_empty()) {
             let dropped_files = ctx.input(|i| i.raw.dropped_files.clone());
@@ -1143,15 +1260,13 @@ impl eframe::App for HkxToolsApp {
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            // Show visual feedback when files are being dragged over the window
-            if ctx.input(|i| i.raw.hovered_files.len() > 0) {
-                let hovered_files = ctx.input(|i| i.raw.hovered_files.clone());
-                ui.colored_label(Color32::from_rgb(0, 150, 255), format!("📁 Ready to drop {} file(s)", hovered_files.len()));
-                ui.separator();
-            }
-            
             self.render_main_ui(ui);
         });
+
+        // Show drag and drop overlay when files are being hovered
+        if files_being_hovered {
+            self.render_drag_drop_overlay(ctx, hovered_files_count);
+        }
     }
 }
 
