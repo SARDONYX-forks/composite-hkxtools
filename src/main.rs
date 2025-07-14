@@ -1517,8 +1517,6 @@ impl HkxToolsApp {
     }
 
     fn handle_conversion(&mut self, ui: &mut Ui) {
-        ui.add_space(5.0);
-        
         // Check for progress updates
         if let Some(progress_rx) = &mut self.progress_rx {
             while let Ok(progress) = progress_rx.try_recv() {
@@ -1531,55 +1529,125 @@ impl HkxToolsApp {
         // Clone the current status to avoid borrow checker issues
         let current_status = self.conversion_status.clone();
         
-        // Display status and controls based on current state
-        match current_status {
-            ConversionStatus::Idle => {
-                if ui.button("Run Conversion").clicked() {
-                    self.start_conversion();
-                }
-            }
+        // Add separator and space before the button section
+        ui.add_space(15.0);
+        ui.separator();
+        ui.add_space(10.0);
+        
+        // Display status messages if running, completed, or error
+        match &current_status {
             ConversionStatus::Running { current_file, progress, total } => {
-                let mut should_cancel = false;
-                ui.horizontal(|ui| {
-                    ui.label(format!("Converting: {}", current_file));
-                    if ui.button("Cancel").clicked() {
-                        should_cancel = true;
-                    }
+                ui.vertical_centered(|ui| {
+                    ui.label(
+                        RichText::new(format!("Converting: {}", current_file))
+                            .size(14.0)
+                            .color(Color32::from_rgb(100, 150, 255))
+                    );
+                    
+                    // Progress bar
+                    let progress_fraction = if *total > 0 { *progress as f32 / *total as f32 } else { 0.0 };
+                    let progress_bar = egui::ProgressBar::new(progress_fraction)
+                        .text(format!("{}/{}", progress, total))
+                        .desired_height(20.0);
+                    ui.add(progress_bar);
                 });
-                
-                if should_cancel {
-                    if let Some(cancel_tx) = self.cancel_tx.take() {
-                        let _ = cancel_tx.send(());
-                    }
-                    self.conversion_status = ConversionStatus::Idle;
-                }
-                
-                // Progress bar
-                let progress_fraction = if total > 0 { progress as f32 / total as f32 } else { 0.0 };
-                let progress_bar = egui::ProgressBar::new(progress_fraction)
-                    .text(format!("{}/{}", progress, total));
-                ui.add(progress_bar);
                 
                 // Request continuous repaints while running
                 ui.ctx().request_repaint();
             }
             ConversionStatus::Completed { message } => {
-                ui.colored_label(Color32::GREEN, format!("OK: {}", message));
-                if ui.button("Run Another Conversion").clicked() {
-                    self.conversion_status = ConversionStatus::Idle;
-                    self.progress_rx = None;
-                    self.cancel_tx = None;
-                }
+                ui.vertical_centered(|ui| {
+                    ui.label(
+                        RichText::new(message)
+                            .size(14.0)
+                            .color(Color32::from_rgb(100, 200, 100))
+                            .strong()
+                    );
+                });
             }
             ConversionStatus::Error { message } => {
-                ui.colored_label(Color32::RED, format!("NOT OK: {}", message));
-                if ui.button("Try Again").clicked() {
-                    self.conversion_status = ConversionStatus::Idle;
-                    self.progress_rx = None;
-                    self.cancel_tx = None;
-                }
+                ui.vertical_centered(|ui| {
+                    ui.label(
+                        RichText::new(message)
+                            .size(14.0)
+                            .color(Color32::from_rgb(255, 120, 120))
+                            .strong()
+                    );
+                });
+            }
+            ConversionStatus::Idle => {
+                // No status message when idle
             }
         }
+        
+        ui.add_space(10.0);
+        
+        // Big prominent button at the bottom
+        ui.vertical_centered(|ui| {
+            match current_status {
+                ConversionStatus::Idle => {
+                    let button = egui::Button::new(
+                        RichText::new("🚀 RUN CONVERSION")
+                            .size(18.0)
+                            .strong()
+                    )
+                    .min_size(egui::Vec2::new(ui.available_width() - 20.0, 50.0))
+                    .fill(Color32::from_rgb(70, 130, 220));
+                    
+                    if ui.add(button).clicked() {
+                        self.start_conversion();
+                    }
+                }
+                ConversionStatus::Running { .. } => {
+                    let button = egui::Button::new(
+                        RichText::new("⏹ CANCEL CONVERSION")
+                            .size(16.0)
+                            .strong()
+                    )
+                    .min_size(egui::Vec2::new(ui.available_width() - 20.0, 45.0))
+                    .fill(Color32::from_rgb(200, 80, 80));
+                    
+                    if ui.add(button).clicked() {
+                        if let Some(cancel_tx) = self.cancel_tx.take() {
+                            let _ = cancel_tx.send(());
+                        }
+                        self.conversion_status = ConversionStatus::Idle;
+                    }
+                }
+                ConversionStatus::Completed { .. } => {
+                    let button = egui::Button::new(
+                        RichText::new("🔄 RUN ANOTHER CONVERSION")
+                            .size(16.0)
+                            .strong()
+                    )
+                    .min_size(egui::Vec2::new(ui.available_width() - 20.0, 45.0))
+                    .fill(Color32::from_rgb(100, 180, 100));
+                    
+                    if ui.add(button).clicked() {
+                        self.conversion_status = ConversionStatus::Idle;
+                        self.progress_rx = None;
+                        self.cancel_tx = None;
+                    }
+                }
+                ConversionStatus::Error { .. } => {
+                    let button = egui::Button::new(
+                        RichText::new("🔄 TRY AGAIN")
+                            .size(16.0)
+                            .strong()
+                    )
+                    .min_size(egui::Vec2::new(ui.available_width() - 20.0, 45.0))
+                    .fill(Color32::from_rgb(220, 130, 70));
+                    
+                    if ui.add(button).clicked() {
+                        self.conversion_status = ConversionStatus::Idle;
+                        self.progress_rx = None;
+                        self.cancel_tx = None;
+                    }
+                }
+            }
+        });
+        
+        ui.add_space(15.0);
     }
 }
 
@@ -1638,7 +1706,7 @@ async fn main() -> Result<(), eframe::Error> {
 
     // Window width and height
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([600.0, 680.0]),
+        viewport: egui::ViewportBuilder::default().with_inner_size([600.0, 720.0]),
         ..Default::default()
     };
     
