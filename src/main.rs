@@ -4,6 +4,7 @@ use egui::{Color32, Context as EguiContext, RichText, Ui};
 use rfd::FileDialog;
 use std::fs;
 use std::path::{Path, PathBuf};
+use tempfile;
 use tokio::process::Command;
 use tokio::sync::{mpsc, oneshot};
 use futures::future::join_all;
@@ -11,12 +12,14 @@ use futures::future::join_all;
 const HKXCMD_EXE: &[u8] = include_bytes!("hkxcmd.exe");
 const HKXC_EXE: &[u8] = include_bytes!("hkxc.exe");
 const HKXCONV_EXE: &[u8] = include_bytes!("hkxconv.exe");
+const SSE_TO_LE_HKO: &[u8] = include_bytes!("_SSEtoLE.hko");
 
 #[derive(PartialEq, Clone, Copy, Debug)]
 enum ConverterTool {
     HkxCmd,
     HkxC,
     HkxConv,
+    Hct,
 }
 
 impl ConverterTool {
@@ -25,6 +28,7 @@ impl ConverterTool {
             ConverterTool::HkxCmd => "hkxcmd",
             ConverterTool::HkxC => "hkxc",
             ConverterTool::HkxConv => "hkxconv",
+            ConverterTool::Hct => "HCT",
         }
     }
 }
@@ -81,6 +85,7 @@ impl InputFileExtension {
                 ConverterTool::HkxCmd => "All (HKX, XML, KF)",
                 ConverterTool::HkxC => "All (HKX, XML)",
                 ConverterTool::HkxConv => "All (HKX, XML)",
+                ConverterTool::Hct => "All (HKX only)",
             },
             InputFileExtension::Hkx => "HKX only",
             InputFileExtension::Xml => "XML only",
@@ -102,6 +107,7 @@ struct HkxToolsApp {
     hkxcmd_path: PathBuf,
     hkxc_path: PathBuf,
     hkxconv_path: PathBuf,
+    sse_to_le_hko_path: PathBuf,
     // Async operation fields
     conversion_status: ConversionStatus,
     progress_rx: Option<mpsc::UnboundedReceiver<ConversionProgress>>,
@@ -148,6 +154,7 @@ impl Default for HkxToolsApp {
             hkxcmd_path: PathBuf::new(),
             hkxc_path: PathBuf::new(),
             hkxconv_path: PathBuf::new(),
+            sse_to_le_hko_path: PathBuf::new(),
             conversion_status: ConversionStatus::Idle,
             progress_rx: None,
             cancel_tx: None,
@@ -165,14 +172,23 @@ struct TempConversionContext {
     hkxcmd_path: PathBuf,
     hkxc_path: PathBuf,
     hkxconv_path: PathBuf,
+    sse_to_le_hko_path: PathBuf,
 }
 
 impl TempConversionContext {
     async fn run_conversion_tool(&self, input: &Path, output: &Path) -> Result<()> {
-        let (executable_path, tool_name) = match self.converter_tool {
-            ConverterTool::HkxCmd => (&self.hkxcmd_path, "hkxcmd"),
-            ConverterTool::HkxC => (&self.hkxc_path, "hkxc"),
-            ConverterTool::HkxConv => (&self.hkxconv_path, "hkxconv"),
+        let mut command = match self.converter_tool {
+            ConverterTool::HkxCmd => Command::new(&self.hkxcmd_path),
+            ConverterTool::HkxC => Command::new(&self.hkxc_path),
+            ConverterTool::HkxConv => Command::new(&self.hkxconv_path),
+            ConverterTool::Hct => Command::new("hctStandAloneFilterManager.exe"),
+        };
+        
+        let tool_name = match self.converter_tool {
+            ConverterTool::HkxCmd => "hkxcmd",
+            ConverterTool::HkxC => "hkxc",
+            ConverterTool::HkxConv => "hkxconv",
+            ConverterTool::Hct => "hctStandAloneFilterManager",
         };
 
         // Convert paths to absolute paths to avoid issues with paths starting with '-'
@@ -183,19 +199,26 @@ impl TempConversionContext {
         let skeleton_absolute = self.skeleton_file.as_ref().map(|skeleton| {
             skeleton.canonicalize().unwrap_or_else(|_| skeleton.to_path_buf())
         });
-
-        let mut command = Command::new(executable_path);
         
         // Set the command based on conversion mode
         match self.conversion_mode {
             ConversionMode::Regular => {
-                command.arg("convert");
+                if self.converter_tool != ConverterTool::Hct {
+                    command.arg("convert");
+                }
+                // HCT doesn't need a command argument
             }
             ConversionMode::KfToHkx => {
-                command.arg("convertkf");
+                if self.converter_tool != ConverterTool::Hct {
+                    command.arg("ConvertKF");
+                }
+                // HCT doesn't support KF conversion
             }
             ConversionMode::HkxToKf => {
-                command.arg("exportkf");
+                if self.converter_tool != ConverterTool::Hct {
+                    command.arg("exportkf");
+                }
+                // HCT doesn't support KF conversion
             }
         }
 
@@ -260,10 +283,102 @@ impl TempConversionContext {
             (ConversionMode::HkxToKf, ConverterTool::HkxConv) => {
                 return Err(anyhow::anyhow!("hkxconv does not support KF conversion"));
             }
+            (ConversionMode::Regular, ConverterTool::Hct) => {
+                // For HCT, create a unique temporary directory for this conversion
+                let temp_dir = tempfile::Builder::new()
+                    .prefix("hct_conversion_")
+                    .tempdir()
+                    .context("Failed to create temporary directory for HCT conversion")?;
+                
+                // HCT only supports SSE to LE conversion
+                let source_hko_path = &self.sse_to_le_hko_path;
+                
+                // Copy the .hko file to the temporary directory
+                let hko_filename = source_hko_path.file_name().unwrap();
+                let temp_hko_path = temp_dir.path().join(hko_filename);
+                fs::copy(source_hko_path, &temp_hko_path)
+                    .context("Failed to copy .hko file to temporary directory")?;
+                
+                println!("HCT temp dir: {:?}, using .hko: {:?}", temp_dir.path(), hko_filename);
+                
+                // Set working directory to temp directory and use relative .hko filename
+                command.current_dir(temp_dir.path());
+                command.arg(&input_absolute);
+                command.arg("-s");
+                command.arg(hko_filename);  // Just the filename, not full path
+                
+                // Execute the command
+                let cmd_output = command.output().await.context("Failed to execute HCT converter tool")?;
+                let stderr = String::from_utf8_lossy(&cmd_output.stderr);
+
+                if !cmd_output.status.success() {
+                    return Err(anyhow::anyhow!("{} failed: {}", tool_name, stderr));
+                }
+                
+                // HCT creates "filename.hkx" in the same directory as the .hko file
+                let hct_output_file = temp_dir.path().join("filename.hkx");
+                
+                // Debug: List all files in temp directory
+                println!("Temp directory contents:");
+                if let Ok(entries) = fs::read_dir(temp_dir.path()) {
+                    for entry in entries.flatten() {
+                        println!("  {:?}", entry.path());
+                    }
+                } else {
+                    println!("  Failed to read temp directory");
+                }
+                
+                if !hct_output_file.exists() {
+                    return Err(anyhow::anyhow!("HCT did not produce expected output file: {:?}", hct_output_file));
+                }
+                
+                println!("HCT output file exists: {:?}", hct_output_file);
+                println!("Target output path: {:?}", output_absolute);
+                
+                // Create output directory if it doesn't exist
+                if let Some(parent) = output_absolute.parent() {
+                    println!("Creating output directory: {:?}", parent);
+                    fs::create_dir_all(parent).context("Failed to create output directory")?;
+                }
+                
+                // Check if target file already exists and remove it if necessary
+                if output_absolute.exists() {
+                    println!("Target file already exists, removing: {:?}", output_absolute);
+                    fs::remove_file(&output_absolute).context("Failed to remove existing target file")?;
+                }
+                
+                // Move the HCT output file directly to the final location
+                // The output_absolute path already includes any suffix/extension modifications
+                match fs::rename(&hct_output_file, &output_absolute) {
+                    Ok(_) => {
+                        println!("Successfully moved HCT output to: {:?}", output_absolute);
+                    }
+                    Err(e) => {
+                        // If rename fails, try copy + delete as fallback
+                        println!("Rename failed ({}), trying copy + delete fallback", e);
+                        fs::copy(&hct_output_file, &output_absolute)
+                            .context("Failed to copy HCT output file to final location")?;
+                        fs::remove_file(&hct_output_file)
+                            .context("Failed to remove temporary HCT output file after copy")?;
+                        println!("Successfully copied HCT output to: {:?}", output_absolute);
+                    }
+                }
+                
+                println!("HCT conversion complete: {:?} -> {:?}", input_absolute, output_absolute);
+                
+                // temp_dir will be automatically cleaned up when it goes out of scope
+                return Ok(());
+            }
+            (ConversionMode::KfToHkx, ConverterTool::Hct) => {
+                return Err(anyhow::anyhow!("HCT does not support KF conversion"));
+            }
+            (ConversionMode::HkxToKf, ConverterTool::Hct) => {
+                return Err(anyhow::anyhow!("HCT does not support KF conversion"));
+            }
         }
 
         // Print the command being executed for debugging
-        println!("EXECUTING COMMAND: {:?} with input: {:?}, output: {:?}", executable_path, input_absolute, output_absolute);
+        println!("EXECUTING COMMAND: {:?} with input: {:?}, output: {:?}", tool_name, input_absolute, output_absolute);
 
         let output = command.output().await.context("Failed to execute converter tool")?;
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -277,7 +392,7 @@ impl TempConversionContext {
 }
 
 impl HkxToolsApp {
-    fn new(hkxcmd_path: PathBuf, hkxc_path: PathBuf, hkxconv_path: PathBuf, tokio_handle: tokio::runtime::Handle) -> Self {
+    fn new(hkxcmd_path: PathBuf, hkxc_path: PathBuf, hkxconv_path: PathBuf, sse_to_le_hko_path: PathBuf, tokio_handle: tokio::runtime::Handle) -> Self {
         Self {
             input_paths: Vec::new(),
             output_folder: None,
@@ -291,6 +406,7 @@ impl HkxToolsApp {
             hkxcmd_path,
             hkxc_path,
             hkxconv_path,
+            sse_to_le_hko_path,
             conversion_status: ConversionStatus::Idle,
             progress_rx: None,
             cancel_tx: None,
@@ -315,11 +431,18 @@ impl HkxToolsApp {
             if path.is_file() {
                 let matches = match self.input_file_extension {
                     InputFileExtension::All => {
-                        if self.converter_tool == ConverterTool::HkxCmd {
-                            path.extension().map_or(false, |ext| ext == "hkx" || ext == "xml" || ext == "kf")
-                        } else {
-                            // hkxc and hkxconv don't support KF files
-                            path.extension().map_or(false, |ext| ext == "hkx" || ext == "xml")
+                        match self.converter_tool {
+                            ConverterTool::HkxCmd => {
+                                path.extension().map_or(false, |ext| ext == "hkx" || ext == "xml" || ext == "kf")
+                            }
+                            ConverterTool::HkxC | ConverterTool::HkxConv => {
+                                // hkxc and hkxconv don't support KF files
+                                path.extension().map_or(false, |ext| ext == "hkx" || ext == "xml")
+                            }
+                            ConverterTool::Hct => {
+                                // HCT doesn't support KF or XML files
+                                path.extension().map_or(false, |ext| ext == "hkx")
+                            }
                         }
                     }
                     InputFileExtension::Hkx => {
@@ -348,11 +471,18 @@ impl HkxToolsApp {
             if path.is_file() {
                 let matches = match self.input_file_extension {
                     InputFileExtension::All => {
-                        if self.converter_tool == ConverterTool::HkxCmd {
-                            path.extension().map_or(false, |ext| ext == "hkx" || ext == "xml" || ext == "kf")
-                        } else {
-                            // hkxc and hkxconv don't support KF files
-                            path.extension().map_or(false, |ext| ext == "hkx" || ext == "xml")
+                        match self.converter_tool {
+                            ConverterTool::HkxCmd => {
+                                path.extension().map_or(false, |ext| ext == "hkx" || ext == "xml" || ext == "kf")
+                            }
+                            ConverterTool::HkxC | ConverterTool::HkxConv => {
+                                // hkxc and hkxconv don't support KF files
+                                path.extension().map_or(false, |ext| ext == "hkx" || ext == "xml")
+                            }
+                            ConverterTool::Hct => {
+                                // HCT doesn't support KF or XML files
+                                path.extension().map_or(false, |ext| ext == "hkx")
+                            }
                         }
                     }
                     InputFileExtension::Hkx => {
@@ -388,11 +518,18 @@ impl HkxToolsApp {
 
         let matches = match self.input_file_extension {
             InputFileExtension::All => {
-                if self.converter_tool == ConverterTool::HkxCmd {
-                    file_path.extension().map_or(false, |ext| ext == "hkx" || ext == "xml" || ext == "kf")
-                } else {
-                    // hkxc and hkxconv don't support KF files
-                    file_path.extension().map_or(false, |ext| ext == "hkx" || ext == "xml")
+                match self.converter_tool {
+                    ConverterTool::HkxCmd => {
+                        file_path.extension().map_or(false, |ext| ext == "hkx" || ext == "xml" || ext == "kf")
+                    }
+                    ConverterTool::HkxC | ConverterTool::HkxConv => {
+                        // hkxc and hkxconv don't support KF files
+                        file_path.extension().map_or(false, |ext| ext == "hkx" || ext == "xml")
+                    }
+                    ConverterTool::Hct => {
+                        // HCT doesn't support KF or XML files
+                        file_path.extension().map_or(false, |ext| ext == "hkx")
+                    }
                 }
             }
             InputFileExtension::Hkx => {
@@ -541,7 +678,7 @@ impl HkxToolsApp {
                                         // Supported formats
                                         let supported_formats = match self.converter_tool {
                                             ConverterTool::HkxCmd => "Supports: HKX, XML, KF files",
-                                            ConverterTool::HkxC | ConverterTool::HkxConv => "Supports: HKX, XML files",
+                                            ConverterTool::HkxC | ConverterTool::HkxConv | ConverterTool::Hct => "Supports: HKX, XML files",
                                         };
                                         
                                         ui.label(
@@ -680,6 +817,7 @@ impl HkxToolsApp {
         let hkxcmd_path = self.hkxcmd_path.clone();
         let hkxc_path = self.hkxc_path.clone();
         let hkxconv_path = self.hkxconv_path.clone();
+        let sse_to_le_hko_path = self.sse_to_le_hko_path.clone();
 
         // Spawn the async conversion task
         self.tokio_handle.spawn(async move {
@@ -695,6 +833,7 @@ impl HkxToolsApp {
                 hkxcmd_path,
                 hkxc_path,
                 hkxconv_path,
+                sse_to_le_hko_path,
                 progress_tx,
                 cancel_rx,
             ).await;
@@ -716,12 +855,17 @@ impl HkxToolsApp {
         hkxcmd_path: PathBuf,
         hkxc_path: PathBuf,
         hkxconv_path: PathBuf,
+        sse_to_le_hko_path: PathBuf,
         progress_tx: mpsc::UnboundedSender<ConversionProgress>,
         mut cancel_rx: oneshot::Receiver<()>,
     ) -> Result<()> {
         let total_files = input_paths.len();
-
-        // Create all conversion tasks concurrently
+        
+        // HCT can now process asynchronously with isolated temp directories
+        println!("Processing {} files with {}", total_files, match converter_tool {
+            ConverterTool::Hct => "HCT (using isolated temp directories)",
+            _ => "concurrent processing"
+        });
         let mut conversion_tasks = Vec::new();
         
         for (index, input_path) in input_paths.iter().enumerate() {
@@ -762,6 +906,7 @@ impl HkxToolsApp {
                 hkxcmd_path: hkxcmd_path.clone(),
                 hkxc_path: hkxc_path.clone(),
                 hkxconv_path: hkxconv_path.clone(),
+                sse_to_le_hko_path: sse_to_le_hko_path.clone(),
             };
 
             // Clone needed data for the async task
@@ -925,23 +1070,31 @@ impl HkxToolsApp {
             .show(ui, |ui| {
                 ui.label("Converter Tool:");
                 ui.horizontal(|ui| {
-                    for tool in [ConverterTool::HkxCmd, ConverterTool::HkxC, ConverterTool::HkxConv] {
+                    for tool in [ConverterTool::HkxCmd, ConverterTool::HkxC, ConverterTool::HkxConv, ConverterTool::Hct] {
                         if ui
                             .selectable_label(self.converter_tool == tool, tool.label())
                             .clicked()
                         {
                             self.converter_tool = tool;
-                            // Reset to regular mode if hkxc or hkxconv is selected and we're in KF mode
-                            if (tool == ConverterTool::HkxC || tool == ConverterTool::HkxConv) && self.conversion_mode != ConversionMode::Regular {
+                            // Reset to regular mode if hkxc, hkxconv, or HCT is selected and we're in KF mode
+                            if (tool == ConverterTool::HkxC || tool == ConverterTool::HkxConv || tool == ConverterTool::Hct) && self.conversion_mode != ConversionMode::Regular {
                                 self.conversion_mode = ConversionMode::Regular;
                             }
-                            // Reset input file extension if hkxc or hkxconv is selected and current filter is KF
-                            if (tool == ConverterTool::HkxC || tool == ConverterTool::HkxConv) && self.input_file_extension == InputFileExtension::Kf {
+                            // Reset input file extension if hkxc, hkxconv, or HCT is selected and current filter is KF
+                            if (tool == ConverterTool::HkxC || tool == ConverterTool::HkxConv || tool == ConverterTool::Hct) && self.input_file_extension == InputFileExtension::Kf {
+                                self.input_file_extension = InputFileExtension::Hkx;
+                            }
+                            // Reset input file extension if HCT is selected and current filter is XML
+                            if tool == ConverterTool::Hct && self.input_file_extension == InputFileExtension::Xml {
                                 self.input_file_extension = InputFileExtension::Hkx;
                             }
                             // Reset output format if hkxconv is selected and current format is Skyrim LE
                             if tool == ConverterTool::HkxConv && self.output_format == OutputFormat::SkyrimLE {
                                 self.output_format = OutputFormat::SkyrimSE;
+                            }
+                            // Reset output format if HCT is selected and current format is not LE
+                            if tool == ConverterTool::Hct && (self.output_format == OutputFormat::SkyrimSE || self.output_format == OutputFormat::Xml) {
+                                self.output_format = OutputFormat::SkyrimLE;
                             }
                         }
                     }
@@ -956,6 +1109,8 @@ impl HkxToolsApp {
                             (ConversionMode::HkxToKf, ConverterTool::HkxC) => false,
                             (ConversionMode::KfToHkx, ConverterTool::HkxConv) => false,
                             (ConversionMode::HkxToKf, ConverterTool::HkxConv) => false,
+                            (ConversionMode::KfToHkx, ConverterTool::Hct) => false,
+                            (ConversionMode::HkxToKf, ConverterTool::Hct) => false,
                             _ => true,
                         };
                         ui.add_enabled_ui(is_enabled, |ui| {
@@ -969,20 +1124,30 @@ impl HkxToolsApp {
 
                 ui.label("Input File Filter:");
                 ui.horizontal(|ui| {
-                    let available_filters = if self.converter_tool == ConverterTool::HkxCmd {
-                        vec![
-                            InputFileExtension::All,
-                            InputFileExtension::Hkx,
-                            InputFileExtension::Xml,
-                            InputFileExtension::Kf,
-                        ]
-                    } else {
-                        // hkxc and hkxconv don't support KF files
-                        vec![
-                            InputFileExtension::All,
-                            InputFileExtension::Hkx,
-                            InputFileExtension::Xml,
-                        ]
+                    let available_filters = match self.converter_tool {
+                        ConverterTool::HkxCmd => {
+                            vec![
+                                InputFileExtension::All,
+                                InputFileExtension::Hkx,
+                                InputFileExtension::Xml,
+                                InputFileExtension::Kf,
+                            ]
+                        }
+                        ConverterTool::HkxC | ConverterTool::HkxConv => {
+                            // hkxc and hkxconv don't support KF files
+                            vec![
+                                InputFileExtension::All,
+                                InputFileExtension::Hkx,
+                                InputFileExtension::Xml,
+                            ]
+                        }
+                        ConverterTool::Hct => {
+                            // HCT doesn't support KF or XML files
+                            vec![
+                                InputFileExtension::All,
+                                InputFileExtension::Hkx,
+                            ]
+                        }
                     };
                     
                     for filter in available_filters {
@@ -1098,6 +1263,13 @@ impl HkxToolsApp {
             ui.label(RichText::new("💡 Tip: You can drag and drop files or folders directly onto this window").color(Color32::from_rgb(100, 100, 100)).size(12.0));
         });
         
+        // Show HCT processing note
+        if self.converter_tool == ConverterTool::Hct {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("ℹ️ HCT files use isolated temp directories for safe concurrent processing").color(Color32::from_rgb(100, 100, 100)).size(12.0));
+            });
+        }
+        
         // Scrollable area for file list with maximum height
         let scroll_area_height = 200.0;
         let files_to_remove = ui.allocate_ui_with_layout(
@@ -1162,6 +1334,12 @@ impl HkxToolsApp {
                         OutputFormat::SkyrimSE,
                     ]
                 }
+                ConverterTool::Hct => {
+                    // HCT only supports LE conversion
+                    vec![
+                        OutputFormat::SkyrimLE,
+                    ]
+                }
             };
             
             for format in available_formats {
@@ -1176,6 +1354,17 @@ impl HkxToolsApp {
             // Reset to a valid format if current selection is not available
             if self.converter_tool == ConverterTool::HkxConv && self.output_format == OutputFormat::SkyrimLE {
                 self.output_format = OutputFormat::SkyrimSE;
+            }
+            if self.converter_tool == ConverterTool::Hct && (self.output_format == OutputFormat::SkyrimSE || self.output_format == OutputFormat::Xml) {
+                self.output_format = OutputFormat::SkyrimLE;
+            }
+            
+            // Reset to a valid filter if current selection is not available
+            if (self.converter_tool == ConverterTool::HkxC || self.converter_tool == ConverterTool::HkxConv || self.converter_tool == ConverterTool::Hct) && self.input_file_extension == InputFileExtension::Kf {
+                self.input_file_extension = InputFileExtension::Hkx;
+            }
+            if self.converter_tool == ConverterTool::Hct && self.input_file_extension == InputFileExtension::Xml {
+                self.input_file_extension = InputFileExtension::Hkx;
             }
         });
     }
@@ -1275,7 +1464,7 @@ async fn main() -> Result<(), eframe::Error> {
     // Create a tokio runtime handle for the GUI
     let tokio_handle = tokio::runtime::Handle::current();
 
-    // Write hkxcmd.exe, hkxc.exe, and hkxconv.exe to a temporary location
+    // Write hkxcmd.exe, hkxc.exe, hkxconv.exe, and HCT .hko file to a temporary location
     let temp_dir = tempfile::Builder::new()
         .prefix("hkxtools_")
         .tempdir()
@@ -1284,17 +1473,22 @@ async fn main() -> Result<(), eframe::Error> {
     let hkxcmd_path = temp_dir.path().join("hkxcmd.exe");
     let hkxc_path = temp_dir.path().join("hkxc.exe");
     let hkxconv_path = temp_dir.path().join("hkxconv.exe");
+    let sse_to_le_hko_path = temp_dir.path().join("_SSEtoLE.hko");
     
     fs::write(&hkxcmd_path, HKXCMD_EXE).unwrap();
     fs::write(&hkxc_path, HKXC_EXE).unwrap();
     fs::write(&hkxconv_path, HKXCONV_EXE).unwrap();
+    fs::write(&sse_to_le_hko_path, SSE_TO_LE_HKO).unwrap();
 
     println!("Extracted hkxcmd.exe to: {:?}", hkxcmd_path);
     println!("Extracted hkxc.exe to: {:?}", hkxc_path);
     println!("Extracted hkxconv.exe to: {:?}", hkxconv_path);
+    println!("Extracted _SSEtoLE.hko to: {:?}", sse_to_le_hko_path);
+    println!("HCT will be called from PATH as: hctStandAloneFilterManager.exe");
 
+    // Window width and height
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([600.0, 625.0]),
+        viewport: egui::ViewportBuilder::default().with_inner_size([600.0, 680.0]),
         ..Default::default()
     };
     
@@ -1304,6 +1498,6 @@ async fn main() -> Result<(), eframe::Error> {
     eframe::run_native(
         "Composite HKX Conversion GUI",
         options,
-        Box::new(move |_cc| Ok(Box::new(HkxToolsApp::new(hkxcmd_path, hkxc_path, hkxconv_path, tokio_handle)))),
+        Box::new(move |_cc| Ok(Box::new(HkxToolsApp::new(hkxcmd_path, hkxc_path, hkxconv_path, sse_to_le_hko_path, tokio_handle)))),
     )
 }
