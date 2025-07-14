@@ -13,6 +13,7 @@ const HKXCMD_EXE: &[u8] = include_bytes!("hkxcmd.exe");
 const HKXC_EXE: &[u8] = include_bytes!("hkxc.exe");
 const HKXCONV_EXE: &[u8] = include_bytes!("hkxconv.exe");
 const SSE_TO_LE_HKO: &[u8] = include_bytes!("_SSEtoLE.hko");
+const HAVOK_BEHAVIOR_POST_PROCESS_EXE: &[u8] = include_bytes!("HavokBehaviorPostProcess.exe");
 
 #[derive(PartialEq, Clone, Copy, Debug)]
 enum ConverterTool {
@@ -20,6 +21,7 @@ enum ConverterTool {
     HkxC,
     HkxConv,
     Hct,
+    HavokBehaviorPostProcess,
 }
 
 impl ConverterTool {
@@ -29,6 +31,7 @@ impl ConverterTool {
             ConverterTool::HkxC => "hkxc",
             ConverterTool::HkxConv => "hkxconv",
             ConverterTool::Hct => "HCT",
+            ConverterTool::HavokBehaviorPostProcess => "HavokBehaviorPostProcess",
         }
     }
 }
@@ -86,6 +89,7 @@ impl InputFileExtension {
                 ConverterTool::HkxC => "All (HKX, XML)",
                 ConverterTool::HkxConv => "All (HKX, XML)",
                 ConverterTool::Hct => "All (HKX only)",
+                ConverterTool::HavokBehaviorPostProcess => "All (HKX only)",
             },
             InputFileExtension::Hkx => "HKX only",
             InputFileExtension::Xml => "XML only",
@@ -108,6 +112,7 @@ struct HkxToolsApp {
     hkxc_path: PathBuf,
     hkxconv_path: PathBuf,
     sse_to_le_hko_path: PathBuf,
+    havok_behavior_post_process_path: PathBuf,
     // Async operation fields
     conversion_status: ConversionStatus,
     progress_rx: Option<mpsc::UnboundedReceiver<ConversionProgress>>,
@@ -155,6 +160,7 @@ impl Default for HkxToolsApp {
             hkxc_path: PathBuf::new(),
             hkxconv_path: PathBuf::new(),
             sse_to_le_hko_path: PathBuf::new(),
+            havok_behavior_post_process_path: PathBuf::new(),
             conversion_status: ConversionStatus::Idle,
             progress_rx: None,
             cancel_tx: None,
@@ -173,6 +179,7 @@ struct TempConversionContext {
     hkxc_path: PathBuf,
     hkxconv_path: PathBuf,
     sse_to_le_hko_path: PathBuf,
+    havok_behavior_post_process_path: PathBuf,
 }
 
 impl TempConversionContext {
@@ -182,6 +189,7 @@ impl TempConversionContext {
             ConverterTool::HkxC => Command::new(&self.hkxc_path),
             ConverterTool::HkxConv => Command::new(&self.hkxconv_path),
             ConverterTool::Hct => Command::new("hctStandAloneFilterManager.exe"),
+            ConverterTool::HavokBehaviorPostProcess => Command::new(&self.havok_behavior_post_process_path),
         };
         
         let tool_name = match self.converter_tool {
@@ -189,24 +197,38 @@ impl TempConversionContext {
             ConverterTool::HkxC => "hkxc",
             ConverterTool::HkxConv => "hkxconv",
             ConverterTool::Hct => "hctStandAloneFilterManager",
+            ConverterTool::HavokBehaviorPostProcess => "HavokBehaviorPostProcess",
         };
 
         // Convert paths to absolute paths to avoid issues with paths starting with '-'
-        let input_absolute = input.canonicalize().unwrap_or_else(|_| input.to_path_buf());
-        let output_absolute = output.canonicalize().unwrap_or_else(|_| output.to_path_buf());
+        // Use absolute paths but avoid canonicalize() which can add \\?\ prefix on Windows
+        let input_absolute = if input.is_absolute() { 
+            input.to_path_buf() 
+        } else { 
+            std::env::current_dir().unwrap_or_default().join(input) 
+        };
+        let output_absolute = if output.is_absolute() { 
+            output.to_path_buf() 
+        } else { 
+            std::env::current_dir().unwrap_or_default().join(output) 
+        };
         
         // Also handle skeleton file if it exists
         let skeleton_absolute = self.skeleton_file.as_ref().map(|skeleton| {
-            skeleton.canonicalize().unwrap_or_else(|_| skeleton.to_path_buf())
+            if skeleton.is_absolute() { 
+                skeleton.to_path_buf() 
+            } else { 
+                std::env::current_dir().unwrap_or_default().join(skeleton) 
+            }
         });
         
         // Set the command based on conversion mode
         match self.conversion_mode {
             ConversionMode::Regular => {
-                if self.converter_tool != ConverterTool::Hct {
+                if self.converter_tool != ConverterTool::Hct && self.converter_tool != ConverterTool::HavokBehaviorPostProcess {
                     command.arg("convert");
                 }
-                // HCT doesn't need a command argument
+                // HCT and HavokBehaviorPostProcess don't need a command argument
             }
             ConversionMode::KfToHkx => {
                 if self.converter_tool != ConverterTool::Hct {
@@ -375,16 +397,100 @@ impl TempConversionContext {
             (ConversionMode::HkxToKf, ConverterTool::Hct) => {
                 return Err(anyhow::anyhow!("HCT does not support KF conversion"));
             }
+            (ConversionMode::Regular, ConverterTool::HavokBehaviorPostProcess) => {
+                // HavokBehaviorPostProcess only supports HKX input files and SSE output
+                if input_absolute.extension().map_or(true, |ext| ext != "hkx") {
+                    return Err(anyhow::anyhow!("HavokBehaviorPostProcess requires an HKX input file."));
+                }
+                
+                // HavokBehaviorPostProcess modifies files in-place, so we need to copy the input to output first
+                println!("Input path: {:?}", input_absolute);
+                println!("Output path: {:?}", output_absolute);
+                println!("Input exists: {}", input_absolute.exists());
+                println!("Output parent exists: {}", output_absolute.parent().map_or(false, |p| p.exists()));
+                println!("Copying input file to output location: {:?} -> {:?}", input_absolute, output_absolute);
+                
+                // Check if input and output are the same
+                if input_absolute == output_absolute {
+                    return Err(anyhow::anyhow!("Input and output paths are the same: {:?}", input_absolute));
+                }
+                
+                // Create output directory if it doesn't exist
+                if let Some(parent) = output_absolute.parent() {
+                    println!("Creating output directory: {:?}", parent);
+                    fs::create_dir_all(parent).context("Failed to create output directory")?;
+                }
+                
+                // Copy input file to output location
+                match fs::copy(&input_absolute, &output_absolute) {
+                    Ok(bytes_copied) => {
+                        println!("Successfully copied {} bytes", bytes_copied);
+                    }
+                    Err(e) => {
+                        println!("Copy failed with error: {:?}", e);
+                        return Err(anyhow::anyhow!("Failed to copy input file to output location: {}", e));
+                    }
+                }
+                
+                // Check file size before processing
+                let file_size_before = fs::metadata(&output_absolute)
+                    .context("Failed to get file metadata before processing")?
+                    .len();
+                println!("File size before HavokBehaviorPostProcess: {} bytes", file_size_before);
+                
+                // Run HavokBehaviorPostProcess on the output file (modifies in-place)
+                command.arg("--platformAmd64");
+                // Both input and output are the same file (in-place modification)
+                // Don't manually add quotes - let Command handle it
+                command.arg(&output_absolute);
+                command.arg(&output_absolute);
+            }
+            (ConversionMode::KfToHkx, ConverterTool::HavokBehaviorPostProcess) => {
+                return Err(anyhow::anyhow!("HavokBehaviorPostProcess does not support KF conversion"));
+            }
+            (ConversionMode::HkxToKf, ConverterTool::HavokBehaviorPostProcess) => {
+                return Err(anyhow::anyhow!("HavokBehaviorPostProcess does not support KF conversion"));
+            }
         }
 
         // Print the command being executed for debugging
         println!("EXECUTING COMMAND: {:?} with input: {:?}, output: {:?}", tool_name, input_absolute, output_absolute);
+        
+        // For HavokBehaviorPostProcess, print the exact command with arguments
+        if self.converter_tool == ConverterTool::HavokBehaviorPostProcess {
+            println!("HavokBehaviorPostProcess command: {:?}", command);
+        }
 
         let output = command.output().await.context("Failed to execute converter tool")?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
+        
+        // For HavokBehaviorPostProcess, print all output for debugging
+        if self.converter_tool == ConverterTool::HavokBehaviorPostProcess {
+            println!("HavokBehaviorPostProcess exit code: {:?}", output.status.code());
+            println!("HavokBehaviorPostProcess stdout: {}", stdout);
+            println!("HavokBehaviorPostProcess stderr: {}", stderr);
+        }
 
         if !output.status.success() {
-            return Err(anyhow::anyhow!("{} failed: {}", tool_name, stderr));
+            return Err(anyhow::anyhow!("{} failed with exit code {:?}: stdout: {} stderr: {}", 
+                tool_name, output.status.code(), stdout, stderr));
+        }
+        
+        // For HavokBehaviorPostProcess, check if the file size changed
+        if self.converter_tool == ConverterTool::HavokBehaviorPostProcess {
+            let file_size_after = fs::metadata(&output_absolute)
+                .context("Failed to get file metadata after processing")?
+                .len();
+            println!("File size after HavokBehaviorPostProcess: {} bytes", file_size_after);
+            
+            if file_size_after == fs::metadata(&input_absolute)
+                .context("Failed to get input file metadata")?
+                .len() {
+                println!("WARNING: Output file size is the same as input file size - conversion may not have worked");
+            } else {
+                println!("SUCCESS: File size changed, conversion appears to have worked");
+            }
         }
 
         Ok(())
@@ -392,7 +498,7 @@ impl TempConversionContext {
 }
 
 impl HkxToolsApp {
-    fn new(hkxcmd_path: PathBuf, hkxc_path: PathBuf, hkxconv_path: PathBuf, sse_to_le_hko_path: PathBuf, tokio_handle: tokio::runtime::Handle) -> Self {
+    fn new(hkxcmd_path: PathBuf, hkxc_path: PathBuf, hkxconv_path: PathBuf, sse_to_le_hko_path: PathBuf, havok_behavior_post_process_path: PathBuf, tokio_handle: tokio::runtime::Handle) -> Self {
         Self {
             input_paths: Vec::new(),
             output_folder: None,
@@ -407,6 +513,7 @@ impl HkxToolsApp {
             hkxc_path,
             hkxconv_path,
             sse_to_le_hko_path,
+            havok_behavior_post_process_path,
             conversion_status: ConversionStatus::Idle,
             progress_rx: None,
             cancel_tx: None,
@@ -441,6 +548,10 @@ impl HkxToolsApp {
                             }
                             ConverterTool::Hct => {
                                 // HCT doesn't support KF or XML files
+                                path.extension().map_or(false, |ext| ext == "hkx")
+                            }
+                            ConverterTool::HavokBehaviorPostProcess => {
+                                // HavokBehaviorPostProcess only supports HKX files
                                 path.extension().map_or(false, |ext| ext == "hkx")
                             }
                         }
@@ -481,6 +592,10 @@ impl HkxToolsApp {
                             }
                             ConverterTool::Hct => {
                                 // HCT doesn't support KF or XML files
+                                path.extension().map_or(false, |ext| ext == "hkx")
+                            }
+                            ConverterTool::HavokBehaviorPostProcess => {
+                                // HavokBehaviorPostProcess only supports HKX files
                                 path.extension().map_or(false, |ext| ext == "hkx")
                             }
                         }
@@ -528,6 +643,10 @@ impl HkxToolsApp {
                     }
                     ConverterTool::Hct => {
                         // HCT doesn't support KF or XML files
+                        file_path.extension().map_or(false, |ext| ext == "hkx")
+                    }
+                    ConverterTool::HavokBehaviorPostProcess => {
+                        // HavokBehaviorPostProcess only supports HKX files
                         file_path.extension().map_or(false, |ext| ext == "hkx")
                     }
                 }
@@ -675,11 +794,12 @@ impl HkxToolsApp {
                                         
                                         ui.add_space(10.0);
                                         
-                                        // Supported formats
-                                        let supported_formats = match self.converter_tool {
-                                            ConverterTool::HkxCmd => "Supports: HKX, XML, KF files",
-                                            ConverterTool::HkxC | ConverterTool::HkxConv | ConverterTool::Hct => "Supports: HKX, XML files",
-                                        };
+                                                                // Supported formats
+                        let supported_formats = match self.converter_tool {
+                            ConverterTool::HkxCmd => "Supports: HKX, XML, KF files",
+                            ConverterTool::HkxC | ConverterTool::HkxConv => "Supports: HKX, XML files",
+                            ConverterTool::Hct | ConverterTool::HavokBehaviorPostProcess => "Supports: HKX files",
+                        };
                                         
                                         ui.label(
                                             RichText::new(supported_formats)
@@ -818,6 +938,7 @@ impl HkxToolsApp {
         let hkxc_path = self.hkxc_path.clone();
         let hkxconv_path = self.hkxconv_path.clone();
         let sse_to_le_hko_path = self.sse_to_le_hko_path.clone();
+        let havok_behavior_post_process_path = self.havok_behavior_post_process_path.clone();
 
         // Spawn the async conversion task
         self.tokio_handle.spawn(async move {
@@ -834,6 +955,7 @@ impl HkxToolsApp {
                 hkxc_path,
                 hkxconv_path,
                 sse_to_le_hko_path,
+                havok_behavior_post_process_path,
                 progress_tx,
                 cancel_rx,
             ).await;
@@ -856,6 +978,7 @@ impl HkxToolsApp {
         hkxc_path: PathBuf,
         hkxconv_path: PathBuf,
         sse_to_le_hko_path: PathBuf,
+        havok_behavior_post_process_path: PathBuf,
         progress_tx: mpsc::UnboundedSender<ConversionProgress>,
         mut cancel_rx: oneshot::Receiver<()>,
     ) -> Result<()> {
@@ -864,6 +987,7 @@ impl HkxToolsApp {
         // HCT can now process asynchronously with isolated temp directories
         println!("Processing {} files with {}", total_files, match converter_tool {
             ConverterTool::Hct => "HCT (using isolated temp directories)",
+            ConverterTool::HavokBehaviorPostProcess => "HavokBehaviorPostProcess",
             _ => "concurrent processing"
         });
         let mut conversion_tasks = Vec::new();
@@ -907,6 +1031,7 @@ impl HkxToolsApp {
                 hkxc_path: hkxc_path.clone(),
                 hkxconv_path: hkxconv_path.clone(),
                 sse_to_le_hko_path: sse_to_le_hko_path.clone(),
+                havok_behavior_post_process_path: havok_behavior_post_process_path.clone(),
             };
 
             // Clone needed data for the async task
@@ -1070,22 +1195,22 @@ impl HkxToolsApp {
             .show(ui, |ui| {
                 ui.label("Converter Tool:");
                 ui.horizontal(|ui| {
-                    for tool in [ConverterTool::HkxCmd, ConverterTool::HkxC, ConverterTool::HkxConv, ConverterTool::Hct] {
+                    for tool in [ConverterTool::HkxCmd, ConverterTool::HkxC, ConverterTool::HkxConv, ConverterTool::Hct, ConverterTool::HavokBehaviorPostProcess] {
                         if ui
                             .selectable_label(self.converter_tool == tool, tool.label())
                             .clicked()
                         {
                             self.converter_tool = tool;
-                            // Reset to regular mode if hkxc, hkxconv, or HCT is selected and we're in KF mode
-                            if (tool == ConverterTool::HkxC || tool == ConverterTool::HkxConv || tool == ConverterTool::Hct) && self.conversion_mode != ConversionMode::Regular {
+                            // Reset to regular mode if hkxc, hkxconv, HCT, or HavokBehaviorPostProcess is selected and we're in KF mode
+                            if (tool == ConverterTool::HkxC || tool == ConverterTool::HkxConv || tool == ConverterTool::Hct || tool == ConverterTool::HavokBehaviorPostProcess) && self.conversion_mode != ConversionMode::Regular {
                                 self.conversion_mode = ConversionMode::Regular;
                             }
-                            // Reset input file extension if hkxc, hkxconv, or HCT is selected and current filter is KF
-                            if (tool == ConverterTool::HkxC || tool == ConverterTool::HkxConv || tool == ConverterTool::Hct) && self.input_file_extension == InputFileExtension::Kf {
+                            // Reset input file extension if hkxc, hkxconv, HCT, or HavokBehaviorPostProcess is selected and current filter is KF
+                            if (tool == ConverterTool::HkxC || tool == ConverterTool::HkxConv || tool == ConverterTool::Hct || tool == ConverterTool::HavokBehaviorPostProcess) && self.input_file_extension == InputFileExtension::Kf {
                                 self.input_file_extension = InputFileExtension::Hkx;
                             }
-                            // Reset input file extension if HCT is selected and current filter is XML
-                            if tool == ConverterTool::Hct && self.input_file_extension == InputFileExtension::Xml {
+                            // Reset input file extension if HCT or HavokBehaviorPostProcess is selected and current filter is XML
+                            if (tool == ConverterTool::Hct || tool == ConverterTool::HavokBehaviorPostProcess) && self.input_file_extension == InputFileExtension::Xml {
                                 self.input_file_extension = InputFileExtension::Hkx;
                             }
                             // Reset output format if hkxconv is selected and current format is Skyrim LE
@@ -1096,6 +1221,10 @@ impl HkxToolsApp {
                             if tool == ConverterTool::Hct && (self.output_format == OutputFormat::SkyrimSE || self.output_format == OutputFormat::Xml) {
                                 self.output_format = OutputFormat::SkyrimLE;
                             }
+                            // Reset output format if HavokBehaviorPostProcess is selected and current format is not SSE
+                            if tool == ConverterTool::HavokBehaviorPostProcess && (self.output_format == OutputFormat::SkyrimLE || self.output_format == OutputFormat::Xml) {
+                                self.output_format = OutputFormat::SkyrimSE;
+                            }
                         }
                     }
                 });
@@ -1103,16 +1232,18 @@ impl HkxToolsApp {
 
                 ui.label("Conversion Mode:");
                 ui.vertical(|ui| {
-                    for mode in [ConversionMode::Regular, ConversionMode::KfToHkx, ConversionMode::HkxToKf] {
-                        let is_enabled = match (mode, self.converter_tool) {
-                            (ConversionMode::KfToHkx, ConverterTool::HkxC) => false,
-                            (ConversionMode::HkxToKf, ConverterTool::HkxC) => false,
-                            (ConversionMode::KfToHkx, ConverterTool::HkxConv) => false,
-                            (ConversionMode::HkxToKf, ConverterTool::HkxConv) => false,
-                            (ConversionMode::KfToHkx, ConverterTool::Hct) => false,
-                            (ConversionMode::HkxToKf, ConverterTool::Hct) => false,
-                            _ => true,
-                        };
+                                            for mode in [ConversionMode::Regular, ConversionMode::KfToHkx, ConversionMode::HkxToKf] {
+                            let is_enabled = match (mode, self.converter_tool) {
+                                (ConversionMode::KfToHkx, ConverterTool::HkxC) => false,
+                                (ConversionMode::HkxToKf, ConverterTool::HkxC) => false,
+                                (ConversionMode::KfToHkx, ConverterTool::HkxConv) => false,
+                                (ConversionMode::HkxToKf, ConverterTool::HkxConv) => false,
+                                (ConversionMode::KfToHkx, ConverterTool::Hct) => false,
+                                (ConversionMode::HkxToKf, ConverterTool::Hct) => false,
+                                (ConversionMode::KfToHkx, ConverterTool::HavokBehaviorPostProcess) => false,
+                                (ConversionMode::HkxToKf, ConverterTool::HavokBehaviorPostProcess) => false,
+                                _ => true,
+                            };
                         ui.add_enabled_ui(is_enabled, |ui| {
                             if ui.selectable_label(self.conversion_mode == mode, mode.label()).clicked() {
                                 self.conversion_mode = mode;
@@ -1143,6 +1274,13 @@ impl HkxToolsApp {
                         }
                         ConverterTool::Hct => {
                             // HCT doesn't support KF or XML files
+                            vec![
+                                InputFileExtension::All,
+                                InputFileExtension::Hkx,
+                            ]
+                        }
+                        ConverterTool::HavokBehaviorPostProcess => {
+                            // HavokBehaviorPostProcess only supports HKX files
                             vec![
                                 InputFileExtension::All,
                                 InputFileExtension::Hkx,
@@ -1264,11 +1402,11 @@ impl HkxToolsApp {
         });
         
         // Show HCT processing note
-        if self.converter_tool == ConverterTool::Hct {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("ℹ️ HCT files use isolated temp directories for safe concurrent processing").color(Color32::from_rgb(100, 100, 100)).size(12.0));
-            });
-        }
+        // if self.converter_tool == ConverterTool::Hct {
+        //     ui.horizontal(|ui| {
+        //         ui.label(RichText::new("ℹ️ HCT files use isolated temp directories for safe concurrent processing").color(Color32::from_rgb(100, 100, 100)).size(12.0));
+        //     });
+        // }
         
         // Scrollable area for file list with maximum height
         let scroll_area_height = 200.0;
@@ -1340,6 +1478,12 @@ impl HkxToolsApp {
                         OutputFormat::SkyrimLE,
                     ]
                 }
+                ConverterTool::HavokBehaviorPostProcess => {
+                    // HavokBehaviorPostProcess only supports SSE
+                    vec![
+                        OutputFormat::SkyrimSE,
+                    ]
+                }
             };
             
             for format in available_formats {
@@ -1358,12 +1502,15 @@ impl HkxToolsApp {
             if self.converter_tool == ConverterTool::Hct && (self.output_format == OutputFormat::SkyrimSE || self.output_format == OutputFormat::Xml) {
                 self.output_format = OutputFormat::SkyrimLE;
             }
+            if self.converter_tool == ConverterTool::HavokBehaviorPostProcess && (self.output_format == OutputFormat::SkyrimLE || self.output_format == OutputFormat::Xml) {
+                self.output_format = OutputFormat::SkyrimSE;
+            }
             
             // Reset to a valid filter if current selection is not available
-            if (self.converter_tool == ConverterTool::HkxC || self.converter_tool == ConverterTool::HkxConv || self.converter_tool == ConverterTool::Hct) && self.input_file_extension == InputFileExtension::Kf {
+            if (self.converter_tool == ConverterTool::HkxC || self.converter_tool == ConverterTool::HkxConv || self.converter_tool == ConverterTool::Hct || self.converter_tool == ConverterTool::HavokBehaviorPostProcess) && self.input_file_extension == InputFileExtension::Kf {
                 self.input_file_extension = InputFileExtension::Hkx;
             }
-            if self.converter_tool == ConverterTool::Hct && self.input_file_extension == InputFileExtension::Xml {
+            if (self.converter_tool == ConverterTool::Hct || self.converter_tool == ConverterTool::HavokBehaviorPostProcess) && self.input_file_extension == InputFileExtension::Xml {
                 self.input_file_extension = InputFileExtension::Hkx;
             }
         });
@@ -1474,16 +1621,19 @@ async fn main() -> Result<(), eframe::Error> {
     let hkxc_path = temp_dir.path().join("hkxc.exe");
     let hkxconv_path = temp_dir.path().join("hkxconv.exe");
     let sse_to_le_hko_path = temp_dir.path().join("_SSEtoLE.hko");
+    let havok_behavior_post_process_path = temp_dir.path().join("HavokBehaviorPostProcess.exe");
     
     fs::write(&hkxcmd_path, HKXCMD_EXE).unwrap();
     fs::write(&hkxc_path, HKXC_EXE).unwrap();
     fs::write(&hkxconv_path, HKXCONV_EXE).unwrap();
     fs::write(&sse_to_le_hko_path, SSE_TO_LE_HKO).unwrap();
+    fs::write(&havok_behavior_post_process_path, HAVOK_BEHAVIOR_POST_PROCESS_EXE).unwrap();
 
     println!("Extracted hkxcmd.exe to: {:?}", hkxcmd_path);
     println!("Extracted hkxc.exe to: {:?}", hkxc_path);
     println!("Extracted hkxconv.exe to: {:?}", hkxconv_path);
     println!("Extracted _SSEtoLE.hko to: {:?}", sse_to_le_hko_path);
+    println!("Extracted HavokBehaviorPostProcess.exe to: {:?}", havok_behavior_post_process_path);
     println!("HCT will be called from PATH as: hctStandAloneFilterManager.exe");
 
     // Window width and height
@@ -1498,6 +1648,6 @@ async fn main() -> Result<(), eframe::Error> {
     eframe::run_native(
         "Composite HKX Conversion GUI",
         options,
-        Box::new(move |_cc| Ok(Box::new(HkxToolsApp::new(hkxcmd_path, hkxc_path, hkxconv_path, sse_to_le_hko_path, tokio_handle)))),
+        Box::new(move |_cc| Ok(Box::new(HkxToolsApp::new(hkxcmd_path, hkxc_path, hkxconv_path, sse_to_le_hko_path, havok_behavior_post_process_path, tokio_handle)))),
     )
 }
