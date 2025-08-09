@@ -34,4 +34,4 @@ jobs:
         with:
           name: composite-hkx-conversion
           path: |
-            ./target/composite-hkx-conversion.exe
+            ./target/release/composite-hkx-conversion.exe
